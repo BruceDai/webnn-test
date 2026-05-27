@@ -14,15 +14,10 @@ const { launchBrowser, killOwnBrowserProcesses, findBrowserRootPid, get_gpu_info
 const parseList = (str) => (str || '').split(',').map(s => s.trim()).filter(s => s.length > 0);
 
 // Helper to identify framework and backend
-const getFramework = (browserArgs) => (browserArgs || '').includes('WebNNOnnxRuntime') ? 'ort' : 'litert';
+const getFramework = (browserArgs) => (browserArgs || '').includes('WebNNLiteRT') ? 'litert' : 'ort';
 const getBackend = (framework, browserArgs, dllResults, device) => {
     // If device is cpu, backend has to be cpu
     if (device === 'cpu') return 'cpu';
-
-    // If DLL check explicitly failed or found nothing, and we are expecting acceleration, fallback to cpu
-    if (dllResults && dllResults.found === false && framework === 'ort') {
-        return 'cpu';
-    }
 
     // Checking DLL naming for backend detection
     if (framework === 'ort' && dllResults && dllResults.modules && dllResults.modules.length > 0) {
@@ -37,14 +32,13 @@ const getBackend = (framework, browserArgs, dllResults, device) => {
     }
 
     const args = browserArgs || '';
-    if (framework === 'litert') return 'cpu'; // Default for litert
     if (args.includes('WebGpuExecutionProvider')) return 'webgpu';
     if (args.includes('OpenVINO')) return 'openvino';
     if (args.includes('Qnn')) return 'qnn';
     if (args.includes('Dml')) return 'dml';
     if (args.includes('MigraphX')) return 'migraphx';
     if (args.includes('Tensorrt')) return 'tensorrt';
-    return 'cpu'; // Default fallback
+    return device;
 };
 
 if (require.main === module && process.env.IS_PLAYWRIGHT_CHILD_PROCESS !== 'true') {
@@ -137,6 +131,7 @@ Examples:
   const skipRetry = args.includes('--skip-retry');
   const baseline = getArg('--baseline');
   const configFile = getArg('--config');
+  const configFileName = configFile ? path.basename(configFile) : 'cli';
   const pauseCase = getArg('--pause');
   const wptRange = getArg('--wpt-range');
 
@@ -208,6 +203,7 @@ Examples:
   process.env.CHROME_CHANNEL = playwrightChannel;
   process.env.TEST_CONFIG_LIST = JSON.stringify(runConfigs);
   process.env.IS_LIST_MODE = process.env.LIST_MODE;
+  process.env.CURRENT_CONFIG_FILE_NAME = configFileName;
   if (emailAddress) {
       process.env.EMAIL_ADDRESS = emailAddress;
       process.env.EMAIL_TO = emailAddress;
@@ -221,6 +217,37 @@ Examples:
   delete process.env.WPT_CASE;
   delete process.env.MODEL_CASE;
   delete process.env.EXTRA_BROWSER_ARGS;
+
+  // Detected later (inside async IIFE) before any runIteration is invoked.
+  // Layout: results/<BrowserName>_<Channel>/<version>/<timestamp>
+  let browserFolderSegment = 'Chrome_Canary';
+
+  const detectBrowserFolderSegment = async () => {
+      try {
+          const channelRaw = playwrightChannel;
+          const browserName = channelRaw.includes('msedge') ? 'Edge' : 'Chrome';
+          let channelLabel = channelRaw.replace(/^chrome-/, '').replace(/^msedge-?/, '');
+          if (!channelLabel || channelLabel === 'chrome') channelLabel = 'Stable';
+          channelLabel = channelLabel.charAt(0).toUpperCase() + channelLabel.slice(1);
+
+          let detectedVersion = 'unknown';
+          try {
+              const launchOpts = { headless: true };
+              if (browserPath) launchOpts.executablePath = browserPath;
+              else launchOpts.channel = playwrightChannel;
+              const tmpBrowser = await chromium.launch(launchOpts);
+              detectedVersion = tmpBrowser.version();
+              await tmpBrowser.close();
+          } catch (e) {
+              console.log(`[Warning] Could not detect browser version up front: ${e.message}`);
+          }
+
+          browserFolderSegment = path.join(`${browserName}_${channelLabel}`, detectedVersion);
+          console.log(`[Info] Result folder base: results/${browserFolderSegment.replace(/\\/g, '/')}`);
+      } catch (e) {
+          console.log(`[Warning] Failed to build browser folder segment: ${e.message}`);
+      }
+  };
 
   // --- Execution & Iteration Loop ---
 
@@ -247,7 +274,7 @@ Examples:
             now.getSeconds().toString().padStart(2, '0');
 
           const reportDir = path.join(__dirname, '..', 'results');
-          const runDir = path.join(reportDir, timestamp);
+          const runDir = path.join(reportDir, browserFolderSegment, timestamp);
 
           if (!fs.existsSync(runDir)) fs.mkdirSync(runDir, {recursive: true});
 
@@ -256,7 +283,7 @@ Examples:
             '-c', path.join(__dirname, '..', 'runner.config.js'),
             'src/main.js',
             '--reporter=line,html',
-            `--output=${path.join('results', timestamp, 'artifacts')}`,
+            `--output=${path.join('results', browserFolderSegment, timestamp, 'artifacts')}`,
             '--timeout=0'
           ];
 
@@ -287,6 +314,7 @@ Examples:
   };
 
   (async () => {
+    await detectBrowserFolderSegment();
     if (process.env.LIST_MODE === 'true') {
          // Run Playwright with specific env to triggering Listing
          await runIteration(1, 1);
@@ -317,7 +345,9 @@ Examples:
 
       test.afterAll(async () => {
           if (browser) {
-              try { await browser.close(); } catch (e) {}
+              try { await browser.close(); } catch (e) {
+                  console.log(`[Debug] afterAll browser.close failed: ${e && e.message ? e.message : e}`);
+              }
           }
           // Kill only our automation's browser process tree (not the user's personal browser).
           if (browserRootPid) {
@@ -352,14 +382,20 @@ Examples:
                     } else if (suite === 'model') {
                         const runner = new ModelRunner(page);
                         Object.keys(runner.models).forEach((k, i) => {
-                             const m = runner.models[k];
-                             console.log(`[${i}] ${k}: ${m.name} (${m.type})`);
+                            const m = runner.models[k];
+                            console.log(`[${i}] ${k}: ${m.name} (${m.type})`);
                         });
                     }
                }
           });
       } else {
           test('Run Configured Tests', async () => {
+              // Launch once per Playwright test. Per-config relaunch still happens below for isolation.
+              const initialInstance = await launchInstance();
+              browser = initialInstance.browser || initialInstance.context;
+              context = initialInstance.context;
+              page = initialInstance.page;
+
               const configs = JSON.parse(process.env.TEST_CONFIG_LIST || '[]');
               let results = [];
               let runner = null;
@@ -382,6 +418,7 @@ Examples:
                    console.log(`\n=== Running Config: ${config.name} (Suite: ${config.suite}, Device: ${config.device}) ===`);
                    let currentDllResults = null;
 
+                   process.env.CURRENT_CONFIG_NAME = config.name || '';
                    process.env.EXTRA_BROWSER_ARGS = config.browserArgs || '';
                    process.env.DEVICE = config.device;
 
@@ -403,7 +440,7 @@ Examples:
                        const pName = (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge')) ? 'msedge.exe' : 'chrome.exe';
                        browserRootPid = findBrowserRootPid(pName);
                        if (browserRootPid) console.log(`[Info] Browser root PID: ${browserRootPid}`);
-                   } catch (e) { /* best effort */ }
+                   } catch (e) { console.log(`[Debug] findBrowserRootPid failed: ${e && e.message ? e.message : e}`); }
 
                    // Capture browser info on first launch
                    if (!browserInfo) {
@@ -421,7 +458,7 @@ Examples:
                                const m = info.product && info.product.match(/\/([\d.]+)/);
                                if (m) version = m[1];
                                await cdp.detach();
-                           } catch (_) {}
+                           } catch (_) { console.log(`[Debug] CDP Browser.getVersion failed: ${_ && _.message ? _.message : _}`); }
 
                            const channelLabel = channel.replace('chrome-', '').replace('chrome', 'stable');
                            browserInfo = {
@@ -446,13 +483,6 @@ Examples:
                    if (browserRootPid) currentRunner.browserRootPid = browserRootPid;
                    runner = currentRunner;
 
-                   if (idx === 0) {
-                        // const processName = (process.env.CHROME_CHANNEL || '').includes('edge') ? 'msedge.exe' : 'chrome.exe';
-                        // Short delay to ensure process is stable
-                        // await new Promise(r => setTimeout(r, 2000));
-                        // dllResults = await currentRunner.checkOnnxruntimeDlls(processName);
-                   }
-
                    process.env.WPT_CASE = config.wptCase || '';
                    process.env.MODEL_CASE = config.modelCase || '';
                    process.env.WPT_RANGE = config.wptRange || '';
@@ -469,10 +499,50 @@ Examples:
                    };
 
                    let runRes = [];
-                   if (config.suite === 'wpt') {
-                       runRes = await currentRunner.runWptTests(context, browser, onFirstCaseComplete);
-                   } else {
-                       runRes = await currentRunner.runModelTests(onFirstCaseComplete);
+                   try {
+                       if (config.suite === 'wpt') {
+                           runRes = await currentRunner.runWptTests(context, browser, onFirstCaseComplete);
+                       } else {
+                           runRes = await currentRunner.runModelTests(onFirstCaseComplete);
+                       }
+                   } catch (suiteErr) {
+                       console.log(`[Fail] Config "${config.name}" (suite=${config.suite}) threw: ${suiteErr && suiteErr.message ? suiteErr.message : suiteErr}. Closing page and force-killing browser...`);
+                       // 1. Close page (raced — a dead renderer can hang page.close)
+                       try {
+                           if (page && !page.isClosed()) {
+                               await Promise.race([
+                                   page.close({ runBeforeUnload: false }),
+                                   new Promise(r => setTimeout(r, 3000))
+                               ]);
+                           }
+                       } catch (e) { console.log(`[Debug] suite-error page.close failed: ${e && e.message ? e.message : e}`); }
+                       // 2. Close context/browser (raced)
+                       try {
+                           if (browser) {
+                               await Promise.race([
+                                   browser.close(),
+                                   new Promise(r => setTimeout(r, 5000))
+                               ]);
+                           }
+                       } catch (e) { console.log(`[Debug] suite-error browser.close failed: ${e && e.message ? e.message : e}`); }
+                       // 3. Force-kill the browser process tree (taskkill /F /T + PowerShell user-data-dir fallback)
+                       try {
+                           if (currentRunner && typeof currentRunner.forceKillBrowserProcessTree === 'function') {
+                               currentRunner.forceKillBrowserProcessTree(`suite error: ${suiteErr && suiteErr.message ? suiteErr.message : 'unknown'}`);
+                           } else {
+                               killOwnBrowserProcesses(browserRootPid);
+                           }
+                       } catch (e) { console.log(`[Debug] suite-error forceKill failed: ${e && e.message ? e.message : e}`); }
+                       // Reset handles so the next config relaunches cleanly
+                       browser = null;
+                       context = null;
+                       page = null;
+                       // Use whatever partial results the runner may have collected (or empty array)
+                       if (currentRunner && Array.isArray(currentRunner.collectedResults)) {
+                           runRes = currentRunner.collectedResults;
+                       } else {
+                           runRes = [];
+                       }
                    }
 
                    // Ensure check ran if for some reason callback wasn't triggered (e.g. 0 tests)
@@ -515,9 +585,9 @@ Examples:
                    let sysGpuInfo = null;
                    let sysCpuInfo = null;
                    let sysNpuInfo = null;
-                   try { sysGpuInfo = get_gpu_info(); } catch(e) {}
-                   try { sysCpuInfo = get_cpu_info(); } catch(e) {}
-                   try { sysNpuInfo = get_npu_info(); } catch(e) {}
+                   try { sysGpuInfo = get_gpu_info(); } catch(e) { console.log(`[Debug] get_gpu_info failed: ${e && e.message ? e.message : e}`); }
+                   try { sysCpuInfo = get_cpu_info(); } catch(e) { console.log(`[Debug] get_cpu_info failed: ${e && e.message ? e.message : e}`); }
+                   try { sysNpuInfo = get_npu_info(); } catch(e) { console.log(`[Debug] get_npu_info failed: ${e && e.message ? e.message : e}`); }
 
                    results.forEach(r => {
                        let deviceName = r.device;
@@ -683,7 +753,7 @@ Examples:
 
                    // --- Generate Plain Text Results ---
                    try {
-                       // Group results by unique framework-backend-device combination
+                       // Group results by configured backend name (config name).
                        const groups = {};
                        // Retrieve system HW Info once (already done above)
 
@@ -708,7 +778,10 @@ Examples:
                        sysInfoText += '==========================\n';
 
                        results.forEach(r => {
-                           const key = `${r.framework}-${r.backend}-${r.deviceName}`;
+                           const keySource = r.configName ||
+                               (r.fullConfig && r.fullConfig.name) ||
+                               `${r.framework}-${r.backend}-${r.deviceName || r.device}`;
+                           const key = keySource.toString().trim();
                            if (!groups[key]) groups[key] = [];
                            groups[key].push(r);
                        });

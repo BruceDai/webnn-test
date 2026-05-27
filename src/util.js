@@ -9,17 +9,64 @@ const { chromium } = require('@playwright/test');
 // Uses the browser root PID (captured at launch) to kill the entire process tree,
 // without affecting the user's personal browser windows.
 function killOwnBrowserProcesses(browserRootPid) {
-    if (!browserRootPid) {
-        console.log('[Warning] No browser PID tracked, skipping targeted cleanup');
-        return 0;
+    let killed = 0;
+    if (browserRootPid) {
+        try {
+            execSync(`taskkill /F /T /PID ${browserRootPid}`, { stdio: 'ignore', timeout: 10000 });
+            console.log(`[Info] Killed browser process tree (root PID: ${browserRootPid})`);
+            killed++;
+        } catch (e) {
+            console.log(`[Debug] taskkill by PID ${browserRootPid} did not complete: ${e && e.message ? e.message : e}`);
+        }
+    } else {
+        console.log('[Warning] No browser PID tracked, falling back to user-data-dir match');
     }
+
+    // Fallback: kill any msedge/chrome process whose CommandLine references our user-data dir.
+    // This handles cases where the tracked root PID was lost or the renderer detached.
     try {
-        execSync(`taskkill /F /T /PID ${browserRootPid}`, { stdio: 'ignore', timeout: 10000 });
-        console.log(`[Info] Killed browser process tree (root PID: ${browserRootPid})`);
-        return 1;
+        const userDataDir = path.join(__dirname, '..', 'user-data').replace(/\\/g, '\\\\');
+        const ps = `Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" | ` +
+                   `Where-Object { $_.CommandLine -like '*${userDataDir}*' } | ` +
+                   `ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} ; $_.ProcessId }`;
+        const out = execSync(`powershell -ExecutionPolicy Bypass -Command "${ps.replace(/"/g, '\\"')}"`, {
+            encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore']
+        }).trim();
+        if (out) {
+            const pids = out.split(/\s+/).filter(Boolean);
+            if (pids.length) {
+                console.log(`[Info] Killed ${pids.length} stray browser process(es) via user-data-dir match: ${pids.join(', ')}`);
+                killed += pids.length;
+            }
+        }
     } catch (e) {
-        // Process may already be dead
-        return 0;
+        console.log(`[Warning] Fallback browser cleanup by user-data-dir failed: ${e && e.message ? e.message : e}`);
+    }
+
+    return killed;
+}
+
+// Check whether the GPU process for our automation's browser is still alive.
+// Chrome/Edge spawn a dedicated child with `--type=gpu-process`; if it crashes
+// (driver hang, OOM, GPU reset), that process disappears while the browser stays up
+// as a white screen. We filter by our user-data dir so we don't see other browser windows.
+// Returns true if at least one matching GPU process exists, false if none.
+// On detection failure (PowerShell error/timeout) returns true to avoid false positives.
+function isGpuProcessAlive() {
+    try {
+        const userDataDir = path.join(__dirname, '..', 'user-data').replace(/\\/g, '\\\\');
+        const ps = `(Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" | ` +
+                   `Where-Object { $_.CommandLine -like '*--type=gpu-process*' -and $_.CommandLine -like '*${userDataDir}*' } | ` +
+                   `Measure-Object).Count`;
+        const out = execSync(`powershell -ExecutionPolicy Bypass -Command "${ps.replace(/"/g, '\\"')}"`, {
+            encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore']
+        }).trim();
+        const count = parseInt(out, 10);
+        if (isNaN(count)) return true;
+        return count > 0;
+    } catch (e) {
+        console.log(`[Debug] Failed to detect GPU process health, defaulting to alive=true: ${e && e.message ? e.message : e}`);
+        return true;
     }
 }
 
@@ -35,12 +82,16 @@ function findBrowserRootPid(processName = 'msedge.exe') {
         const output = execSync(`powershell -ExecutionPolicy Bypass -File "${tempScript}"`, {
             encoding: 'utf8', timeout: 10000
         }).trim();
-        try { fs.unlinkSync(tempScript); } catch (e) {}
+        try { fs.unlinkSync(tempScript); } catch (e) {
+            console.log(`[Debug] Failed to delete temp script ${tempScript}: ${e && e.message ? e.message : e}`);
+        }
         if (output) {
             const pid = parseInt(output.split('\n')[0].trim(), 10);
             if (!isNaN(pid)) return pid;
         }
-    } catch (e) { /* best effort */ }
+    } catch (e) {
+        console.log(`[Debug] findBrowserRootPid failed for ${processName}: ${e && e.message ? e.message : e}`);
+    }
     return null;
 }
 
@@ -194,7 +245,7 @@ ${content}
                     const parsed = JSON.parse(output);
                     gpus = Array.isArray(parsed) ? parsed : [parsed];
                 } catch(e) {
-                    // console.error('Failed to parse GPU info JSON', e);
+                    console.log(`[Debug] Failed to parse GPU info JSON: ${e && e.message ? e.message : e}`);
                 }
 
                 let selectedGpu = null;
@@ -285,16 +336,18 @@ ${content}
      try {
         if (os.platform() === 'win32') {
             // Try to find NPU devices from PnP entities.
-            // Common potential names: "Intel(R) AI Boost", "LNP", "NPU"
+            // Common potential names: "Intel(R) AI Boost", "Intel(R) NPU", "LNP", "NPU"
             // We use word boundary \bNPU\b to avoid matching "Input" (which contains "npu")
-            const cmd = 'powershell -c "Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -match \'\\\\bNPU\\\\b|AI Boost|Hexagon|Movidius\' } | Sort-Object -Property DriverDate -Descending | Select-Object DeviceName, DriverVersion, DeviceID, @{N=\'DriverDate\';E={if($_.DriverDate){([datetime]$_.DriverDate).ToString(\'yyyy/MM/dd\')}}} | ConvertTo-Json -Compress"';
+            const cmd = 'powershell -c "Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -match \'\\\\bNPU\\\\b|Intel.*AI Boost|Intel.*NPU|Hexagon|Movidius\' } | Sort-Object -Property DriverDate -Descending | Select-Object DeviceName, DriverVersion, DeviceID, @{N=\'DriverDate\';E={if($_.DriverDate){([datetime]$_.DriverDate).ToString(\'yyyy/MM/dd\')}}} | ConvertTo-Json -Compress"';
             const output = execSync(cmd, { encoding: 'utf8', timeout: 15000 }).trim();
             if (output) {
                 let npu = null;
                 try {
                     const parsed = JSON.parse(output);
                     npu = Array.isArray(parsed) ? parsed[0] : parsed;
-                } catch(e) { /* ignore */ }
+                } catch(e) {
+                    console.log(`[Debug] Failed to parse NPU info JSON: ${e && e.message ? e.message : e}`);
+                }
 
                 if (npu) {
                     name = npu.DeviceName || 'Unknown NPU';
@@ -317,17 +370,24 @@ ${content}
   }
 
 async function launchBrowser() {
+    // Ensure stale browser processes do not interfere with a new launch.
+    const browserProcessName = (() => {
+        const browserPath = (process.env.BROWSER_PATH || '').toLowerCase();
+        const channel = (process.env.CHROME_CHANNEL || '').toLowerCase();
+        if (browserPath.includes('msedge') || channel.includes('edge')) {
+            return 'msedge.exe';
+        }
+        return 'chrome.exe';
+    })();
+    try {
+        execSync(`taskkill /F /IM ${browserProcessName} /T`, { stdio: 'ignore', timeout: 10000 });
+        console.log(`[Info] Killed existing ${browserProcessName} processes before launch`);
+    } catch (e) {
+        console.log(`[Debug] No existing ${browserProcessName} processes to kill before launch: ${e && e.message ? e.message : e}`);
+    }
+
     // Using flags found in current file + persistent context logic
-    const args = [
-       '--disable-gpu-watchdog',
-       //'--disable-web-security',
-       //'--ignore-certificate-errors',
-       '--enable-features=WebMachineLearningNeuralNetwork',
-       '--webnn-ort-ignore-ep-blocklist',
-       '--ignore-gpu-blocklist',
-       '--disable_webnn_for_npu=0',
-       //'--webnn-ort-logging-level=VERBOSE',
-   ];
+    const args = [];
 
    if (process.env.EXTRA_BROWSER_ARGS) {
        // Split by whitespace followed by -- to allow spaces in argument values
@@ -368,6 +428,7 @@ async function launchBrowser() {
        fs.mkdirSync(userDataDir, { recursive: true });
    }
 
+   console.log(`[Launch] Launch options: ${JSON.stringify(launchOptions)}`);
    console.log(`[Launch] Launching Chrome from: ${userDataDir}`);
 
    let context, page, browser;
@@ -445,7 +506,9 @@ class WebNNRunner {
           sessionFailureMessage = text;
           const msg = shouldRestart ? 'Restarting browser...' : 'Browser restart skipped (last case).';
           console.error(`[Fail] [Auto-Fail] "Failed to create session" detected. ${msg}`);
-          try { await pageInUse.close(); } catch (e) {}
+          try { await pageInUse.close(); } catch (e) {
+              console.log(`[Debug] Failed to close page after session init failure: ${e && e.message ? e.message : e}`);
+          }
         }
       }
     };
@@ -511,7 +574,9 @@ class WebNNRunner {
               try {
                 const currentContext = pageInUse.context();
                 objectToClose = currentContext.browser() || currentContext;
-              } catch (e) { /* context may already be dead */ }
+              } catch (e) {
+                console.log(`[Debug] Failed to resolve current context/browser during recovery: ${e && e.message ? e.message : e}`);
+            }
               const instance = await this.restartBrowserAndContext(objectToClose);
               this.page = instance.page;
           } catch (restartError) {
@@ -531,7 +596,9 @@ class WebNNRunner {
             pageInUse.removeListener('console', failConsoleListener);
             pageInUse.removeListener('pageerror', failErrorListener);
         }
-      } catch (e) {}
+      } catch (e) {
+          console.log(`[Debug] Failed to remove page listeners during cleanup: ${e && e.message ? e.message : e}`);
+      }
     }
   }
 
@@ -550,11 +617,21 @@ class WebNNRunner {
     return true;
   }
 
+  forceKillBrowserProcessTree(reason = 'unspecified') {
+    console.log(`[Info] Force-killing browser process tree (PID: ${this.browserRootPid || 'unknown'}) due to ${reason}.`);
+    const killed = killOwnBrowserProcesses(this.browserRootPid);
+    this.browserRootPid = null;
+    return killed > 0;
+  }
+
   async restartBrowserAndContext(browserToClose) {
     if (browserToClose) {
       try {
         console.log('[Info] Closing browser before restart...');
-        await browserToClose.close();
+        await Promise.race([
+            browserToClose.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Browser close timeout 10000ms exceeded')), 10000))
+        ]);
         console.log('[Success] Browser closed');
       } catch (e) {
         console.log(`[Warning] Error closing browser: ${e.message}`);
@@ -562,11 +639,7 @@ class WebNNRunner {
     }
 
     // Force kill our browser process tree to ensure clean restart
-    if (this.browserRootPid) {
-        console.log(`[Info] Killing browser process tree (PID: ${this.browserRootPid})...`);
-        killOwnBrowserProcesses(this.browserRootPid);
-        this.browserRootPid = null;
-    }
+    this.forceKillBrowserProcessTree('browser restart');
 
     // Wait a bit to ensure process is fully gone
     await new Promise(resolve => setTimeout(resolve, 3000));
@@ -597,6 +670,23 @@ class WebNNRunner {
         newPage = null; // Will be created by caller or here?
     }
 
+    // Refresh tracked browser PID after relaunch so future crash recovery can kill safely.
+    try {
+        const bPath = (process.env.BROWSER_PATH || '').toLowerCase();
+        const processName = (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge'))
+            ? 'msedge.exe'
+            : 'chrome.exe';
+        const newRootPid = findBrowserRootPid(processName);
+        if (newRootPid) {
+            this.browserRootPid = newRootPid;
+            console.log(`[Info] Updated browser root PID after restart: ${newRootPid}`);
+        } else {
+            console.log('[Warning] Unable to resolve browser root PID after restart.');
+        }
+    } catch (e) {
+        console.log(`[Warning] Failed to refresh browser root PID after restart: ${e.message}`);
+    }
+
     return { browser: newBrowser, context: newContext, page: newPage };
   }
 
@@ -622,7 +712,9 @@ class WebNNRunner {
             try {
                 const parsed = JSON.parse(stdout);
                 processes = Array.isArray(parsed) ? parsed : [parsed];
-            } catch(e) { /* Single object or parse error */ }
+            } catch(e) {
+                console.log(`[Debug] Failed to parse process list JSON while checking DLLs: ${e && e.message ? e.message : e}`);
+            }
 
             // Find valid GPU process
             // Priority 1: Has our specific test flag (unambiguous)
@@ -663,7 +755,9 @@ class WebNNRunner {
                             return name.includes('onnxruntime') || name.includes('openvino') || name.includes('directml') || name.includes('tensorrt') || name.includes('migraphx') || name.includes('qnn') ||
                                    path.includes('onnxruntime') || path.includes('openvino') || path.includes('directml') || path.includes('tensorrt') || path.includes('migraphx') || path.includes('qnn');
                         });
-                    } catch(e) {}
+                    } catch(e) {
+                        console.log(`[Debug] Failed to parse module list JSON while checking DLLs: ${e && e.message ? e.message : e}`);
+                    }
                 }
             } catch(e) { console.log('[Info] PowerShell module check failed, trying tasklist...'); }
 
@@ -793,8 +887,22 @@ class WebNNRunner {
     const failedSubcases = results.reduce((sum, r) => sum + r.subcases.failed, 0);
     const passed = results.filter(r => r.result === 'PASS').length;
     const failed = results.filter(r => r.result === 'FAIL').length;
+    const crashed = results.filter(r => r.result === 'CRASH').length;
     const errors = results.filter(r => r.result === 'ERROR').length;
     const skipped = results.filter(r => r.result === 'SKIP').length;
+
+    const toSafeText = (value) => {
+        const text = value == null ? '' : value.toString().trim();
+        return text;
+    };
+
+    const resolveBackendName = (r) => toSafeText(
+        r.configName || (r.fullConfig && r.fullConfig.name) || r.backend
+    );
+
+    const formatBackendKey = (value) => toSafeText(value)
+        .replace(/[^A-Za-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
 
     // Calculate overall regressions and improvements (case-level and subcase-level)
     const allRegressions = [];
@@ -804,13 +912,14 @@ class WebNNRunner {
         if (prev) {
             const isPass = r.result === 'PASS';
             const wasPass = prev === 'PASS';
-            const groupKey = `${r.framework}-${r.backend}-${r.deviceName || r.device || 'unknown'}`;
+            const backendName = formatBackendKey(resolveBackendName(r));
+            const groupKey = backendName;
             if (wasPass && !isPass) {
                 // Case-level regression
-                allRegressions.push({ name: r.testName, result: r.result, prev, group: groupKey, type: 'case' });
+                allRegressions.push({ name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'case' });
             } else if (!wasPass && isPass) {
                 // Case-level improvement
-                allImprovements.push({ name: r.testName, result: r.result, prev, group: groupKey, type: 'case' });
+                allImprovements.push({ name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'case' });
             } else if (r.previousSubcases && r.subcases && r.subcases.total > 0) {
                 // Same case-level result — check subcase-level changes
                 const prevSc = r.previousSubcases;
@@ -819,12 +928,12 @@ class WebNNRunner {
                     // New format: compare passed/total
                     if (curSc.passed < prevSc.passed || (curSc.passed === prevSc.passed && curSc.total > prevSc.total)) {
                         allRegressions.push({
-                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
                             subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`
                         });
                     } else if (curSc.passed > prevSc.passed || (curSc.passed === prevSc.passed && curSc.total < prevSc.total)) {
                         allImprovements.push({
-                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
                             subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`
                         });
                     }
@@ -834,12 +943,12 @@ class WebNNRunner {
                     const prevFailed = prevSc.failed || 0;
                     if (curFailed > prevFailed) {
                         allRegressions.push({
-                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
                             subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`
                         });
                     } else if (curFailed < prevFailed) {
                         allImprovements.push({
-                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
                             subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`
                         });
                     }
@@ -857,6 +966,98 @@ class WebNNRunner {
     const suiteTitle = testSuites.length > 1 ?
       testSuites.map(s => s.toUpperCase()).join(', ') :
       testSuites[0].toUpperCase();
+
+    const makeAnchorId = (value) => toSafeText(value)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+
+    // Per-backend summary table shown at the top of the report.
+    const backendGroups = results.reduce((acc, r) => {
+        const key = formatBackendKey(resolveBackendName(r));
+        if (!acc[key]) acc[key] = [];
+        acc[key].push(r);
+        return acc;
+    }, {});
+
+    const backendSummaryRowsHtml = Object.entries(backendGroups).map(([backendName, group]) => {
+        const cases = group.length;
+        const passCases = group.filter(r => r.result === 'PASS').length;
+        const crashCases = group.filter(r => r.result === 'CRASH').length;
+        const failCases = group.filter(r => r.result !== 'PASS' && r.result !== 'SKIP').length;
+        const subcases = group.reduce((s, r) => s + (r.subcases ? r.subcases.total : 0), 0);
+        const passSubcases = group.reduce((s, r) => s + (r.subcases ? r.subcases.passed : 0), 0);
+        const failSubcases = group.reduce((s, r) => s + (r.subcases ? r.subcases.failed : 0), 0);
+        const successRate = subcases > 0 ? ((passSubcases / subcases) * 100).toFixed(1) : '0.0';
+        const detailAnchorId = `config-${makeAnchorId(backendName)}`;
+
+        return `
+        <tr>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px;"><strong><a href="#${detailAnchorId}" style="color: #0366d6; text-decoration: none;">${backendName}</a></strong></td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px;">${cases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: #28a745; font-weight: bold;">${passCases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: ${failCases > 0 ? '#dc3545' : '#586069'}; font-weight: bold;">${failCases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: ${crashCases > 0 ? '#b03060' : '#586069'}; font-weight: bold;">${crashCases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px;">${subcases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: #28a745; font-weight: bold;">${passSubcases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: ${failSubcases > 0 ? '#dc3545' : '#586069'}; font-weight: bold;">${failSubcases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; font-weight: bold; color: ${parseFloat(successRate) >= 100 ? '#28a745' : '#24292e'};">${successRate}%</td>
+        </tr>`;
+    }).join('');
+
+    const backendSummaryTableHtml = `
+        <div style="margin: 0 0 20px 0; padding: 12px; background-color: #f8fbff; border: 1px solid #c8e1ff; border-radius: 8px;">
+            <h3 style="margin: 0 0 10px 0; color: #0366d6;">Backend Summary</h3>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead>
+                    <tr>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Backend</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Cases</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Pass</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Fail</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Crash</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Subcases</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Pass</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Fail</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Success Rate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${backendSummaryRowsHtml}
+                </tbody>
+            </table>
+        </div>`;
+
+    // Build crash details grouped by backend for summary section.
+    const crashResults = results.filter(r => r.result === 'CRASH');
+    const crashGroups = crashResults.reduce((acc, r) => {
+        const configKey = formatBackendKey(resolveBackendName(r));
+        if (!acc[configKey]) acc[configKey] = [];
+        acc[configKey].push(r);
+        return acc;
+    }, {});
+
+    const crashTestsByBackendHtml = crashResults.length > 0 ? `
+        <div style="margin: 12px 0 20px 0; padding: 12px; background-color: #fff4fb; border: 1px solid #e3b5d5; border-radius: 8px;">
+            <h4 style="margin: 0 0 10px 0; color: #b03060;">Crash Tests By Configuration (${crashResults.length})</h4>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead>
+                    <tr>
+                        <th style="border: 1px solid #e3b5d5; padding: 6px 10px; text-align: left; background-color: #ffe6f3;">Configuration</th>
+                        <th style="border: 1px solid #e3b5d5; padding: 6px 10px; text-align: left; background-color: #ffe6f3;">Test Case</th>
+                        <th style="border: 1px solid #e3b5d5; padding: 6px 10px; text-align: left; background-color: #ffe6f3;">Message</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${Object.entries(crashGroups).map(([configName, items]) => items.map((item, idx) => `
+                    <tr>
+                        <td style="border: 1px solid #f2cfe3; padding: 6px 10px; vertical-align: top;">${idx === 0 ? `<strong>${configName}</strong> (${items.length})` : ''}</td>
+                        <td style="border: 1px solid #f2cfe3; padding: 6px 10px;">${item.testName || item.fileName || 'unknown'}</td>
+                        <td style="border: 1px solid #f2cfe3; padding: 6px 10px; color: #5f2120;">${(item.error || '').toString().slice(0, 500) || '-'}</td>
+                    </tr>`).join('')).join('')}
+                </tbody>
+            </table>
+        </div>` : '';
 
     // Device Info (CPU, GPU, NPU)
     let deviceInfoHtml = '';
@@ -961,7 +1162,7 @@ class WebNNRunner {
         }
     }
 
-    return `
+    const reportHtml = `
 <!DOCTYPE html>
 <html>
 <head>
@@ -993,7 +1194,67 @@ class WebNNRunner {
 
     ${deviceInfoHtml}
 
+    ${backendSummaryTableHtml}
+
+    ${crashTestsByBackendHtml}
+
     <div style="margin-bottom: 20px;">
+        ${baselineDirName && (totalRegressions > 0 || totalImprovements > 0) ? `
+        <div style="margin-bottom: 15px; padding: 12px; background-color: #e3f2fd; border-left: 4px solid #2196f3; border-radius: 4px; font-size: 14px;">
+            <strong>Baseline Comparison:</strong> Comparing against results from <code>${baselineDirName}</code>
+        </div>
+        <div style="margin-bottom: 20px;">
+            ${totalRegressions > 0 ? `
+            <div style="margin-bottom: 12px; padding: 15px; background-color: #fff5f5; border: 1px solid #f5c6cb; border-radius: 8px;">
+                <h4 style="margin: 0 0 10px 0; color: #dc3545;">\u25BC Regressions (${totalRegressions})</h4>
+                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                    <thead>
+                        <tr>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Backend</th>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Test Case</th>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Baseline</th>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Current</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${allRegressions.map(t => `
+                        <tr>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #586069;">${t.backendName || '-'}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
+                        </tr>`).join('')}
+                    </tbody>
+                </table>
+            </div>
+            ` : ''}
+            ${totalImprovements > 0 ? `
+            <div style="margin-bottom: 12px; padding: 15px; background-color: #f0fff4; border: 1px solid #c3e6cb; border-radius: 8px;">
+                <h4 style="margin: 0 0 10px 0; color: #28a745;">\u25B2 Improvements (${totalImprovements})</h4>
+                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                    <thead>
+                        <tr>
+                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Backend</th>
+                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Test Case</th>
+                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Baseline</th>
+                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Current</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${allImprovements.map(t => `
+                        <tr>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #586069;">${t.backendName || '-'}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
+                        </tr>`).join('')}
+                    </tbody>
+                </table>
+            </div>
+            ` : ''}
+        </div>
+        ` : ''}
+
         <h3>Summary</h3>
         <table style="width: 100%; border-collapse: separate; border-spacing: 12px; margin-bottom: 20px;">
             <tr>
@@ -1038,6 +1299,20 @@ class WebNNRunner {
                     <div style="color: #586069; font-size: 14px; font-weight: 500;">Sum of Test Times</div>
                 </td>
             </tr>
+            <tr>
+                <td style="text-align: center; padding: 20px; background-color: ${crashed > 0 ? '#fff4fb' : '#ffffff'}; border: 1px solid ${crashed > 0 ? '#e3b5d5' : '#e1e4e8'}; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                    <div style="font-size: 28px; font-weight: bold; margin-bottom: 8px; color: ${crashed > 0 ? '#b03060' : '#586069'};">${crashed}</div>
+                    <div style="color: #586069; font-size: 14px; font-weight: 500;">Crash Cases</div>
+                </td>
+                <td style="text-align: center; padding: 20px; background-color: ${errors > 0 ? '#fff8f0' : '#ffffff'}; border: 1px solid ${errors > 0 ? '#ffd8a8' : '#e1e4e8'}; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                    <div style="font-size: 28px; font-weight: bold; margin-bottom: 8px; color: ${errors > 0 ? '#fd7e14' : '#586069'};">${errors}</div>
+                    <div style="color: #586069; font-size: 14px; font-weight: 500;">Error Cases</div>
+                </td>
+                <td style="text-align: center; padding: 20px; background-color: ${skipped > 0 ? '#f8f9fa' : '#ffffff'}; border: 1px solid ${skipped > 0 ? '#ced4da' : '#e1e4e8'}; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                    <div style="font-size: 28px; font-weight: bold; margin-bottom: 8px; color: ${skipped > 0 ? '#6c757d' : '#586069'};">${skipped}</div>
+                    <div style="color: #586069; font-size: 14px; font-weight: 500;">Skipped Cases</div>
+                </td>
+            </tr>
             ${baselineDirName ? `
             <tr>
                 <td style="text-align: center; padding: 20px; background-color: ${totalRegressions > 0 ? '#fff5f5' : '#ffffff'}; border: 1px solid ${totalRegressions > 0 ? '#f5c6cb' : '#e1e4e8'}; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
@@ -1055,61 +1330,7 @@ class WebNNRunner {
             </tr>
             ` : ''}
         </table>
-        ${baselineDirName && (totalRegressions > 0 || totalImprovements > 0) ? `
-        <div style="margin-bottom: 15px; padding: 12px; background-color: #e3f2fd; border-left: 4px solid #2196f3; border-radius: 4px; font-size: 14px;">
-            <strong>Baseline Comparison:</strong> Comparing against results from <code>${baselineDirName}</code>
-        </div>
-        <div style="margin-bottom: 20px;">
-            ${totalRegressions > 0 ? `
-            <div style="margin-bottom: 12px; padding: 15px; background-color: #fff5f5; border: 1px solid #f5c6cb; border-radius: 8px;">
-                <h4 style="margin: 0 0 10px 0; color: #dc3545;">\u25BC Regressions (${totalRegressions})</h4>
-                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-                    <thead>
-                        <tr>
-                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Test Case</th>
-                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Configuration</th>
-                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Baseline</th>
-                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Current</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${allRegressions.map(t => `
-                        <tr>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #586069;">${t.group}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
-                        </tr>`).join('')}
-                    </tbody>
-                </table>
-            </div>
-            ` : ''}
-            ${totalImprovements > 0 ? `
-            <div style="margin-bottom: 12px; padding: 15px; background-color: #f0fff4; border: 1px solid #c3e6cb; border-radius: 8px;">
-                <h4 style="margin: 0 0 10px 0; color: #28a745;">\u25B2 Improvements (${totalImprovements})</h4>
-                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-                    <thead>
-                        <tr>
-                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Test Case</th>
-                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Configuration</th>
-                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Baseline</th>
-                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Current</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${allImprovements.map(t => `
-                        <tr>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #586069;">${t.group}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
-                        </tr>`).join('')}
-                    </tbody>
-                </table>
-            </div>
-            ` : ''}
-        </div>
-        ` : ''}
+
     </div>
 
     <h3>Detailed Test Results</h3>
@@ -1119,9 +1340,9 @@ class WebNNRunner {
             const cName = r.configName || 'Default';
             // Group by Config + Device (and backend/framework to be safe for unique tables)
             // Using signature parts ensures separation requested
-            const device = (r.deviceName || r.device || 'unknown').toLowerCase();
-            const framework = (r.framework || 'unknown').toLowerCase();
-            const backend = (r.backend || 'unknown').toLowerCase();
+            const device = toSafeText(r.deviceName || r.device).toLowerCase();
+            const framework = toSafeText(r.framework).toLowerCase();
+            const backend = toSafeText(r.backend).toLowerCase();
 
             const key = `${cName}::${framework}::${backend}::${device}`;
 
@@ -1199,15 +1420,11 @@ class WebNNRunner {
             const wptCaseStr = uniqueConfigValues('wptCase');
             const modelCaseStr = uniqueConfigValues('modelCase');
 
-            // Derive the signature from the first result (assuming config group maps to one signature)
-            // Or if multiple, display primary one
-            const r0 = groupResults[0];
-            const signature = `[${r0.framework || '?'} - ${r0.backend || '?'} - ${r0.deviceName || r0.device || '?'}]`;
-
             // Calculate Group Summary
             const groupTotal = groupResults.length;
             const groupPassed = groupResults.filter(r => r.result === 'PASS').length;
             const groupFailed = groupResults.filter(r => r.result === 'FAIL').length;
+            const groupCrashed = groupResults.filter(r => r.result === 'CRASH').length;
             const groupErrors = groupResults.filter(r => r.result === 'ERROR').length;
             const groupSkipped = groupResults.filter(r => r.result === 'SKIP').length;
             const groupTotalSubcases = groupResults.reduce((s,r)=>s+r.subcases.total,0);
@@ -1256,6 +1473,7 @@ class WebNNRunner {
                  <div style="font-weight: bold; color: #24292e;">Cases: ${groupTotal}</div>
                  <div style="font-weight: bold; color: #28a745;">Pass: ${groupPassed}</div>
                  <div style="font-weight: bold; color: #dc3545;">Fail: ${groupFailed}</div>
+                  ${groupCrashed > 0 ? `<div style="font-weight: bold; color: #b03060;">Crash: ${groupCrashed}</div>` : ''}
                  ${groupErrors > 0 ? `<div style="font-weight: bold; color: #fd7e14;">Error: ${groupErrors}</div>` : ''}
                  ${groupSkipped > 0 ? `<div style="font-weight: bold; color: #6c757d;">Skip: ${groupSkipped}</div>` : ''}
                  <div style="width: 1px; background-color: #e1e4e8; margin: 0 5px;"></div>
@@ -1303,13 +1521,15 @@ class WebNNRunner {
                     <div style="font-weight: bold; color: #24292e;">Device:</div><div>${deviceStr}</div>
                     ${argsStr !== 'N/A' ? `<div style="font-weight: bold; color: #24292e;">Browser Args:</div><div style="font-family: monospace; background-color: #fafbfc; padding: 2px 4px; border-radius: 3px;">${argsStr}</div>` : ''}
                     ${wptCaseStr !== 'N/A' ? `<div style="font-weight: bold; color: #24292e;">WPT Case:</div><div>${wptCaseStr}</div>` : ''}
-                     ${modelCaseStr !== 'N/A' ? `<div style="font-weight: bold; color: #24292e;">Model Case:</div><div>${modelCaseStr}</div>` : ''}
+                    ${modelCaseStr !== 'N/A' ? `<div style="font-weight: bold; color: #24292e;">Model Case:</div><div>${modelCaseStr}</div>` : ''}
                 </div>
             </div>`;
 
+            const configSectionAnchorId = `config-${makeAnchorId(configName)}`;
+
             return `
-            <div style="border: 2px solid #e1e4e8; border-radius: 8px; padding: 20px; margin-bottom: 40px; background-color: #ffffff; box-shadow: 0 2px 8px rgba(0,0,0,0.05);">
-                <h3 style="margin-top: 0; padding-bottom: 15px; border-bottom: 1px solid #e1e4e8; color: #24292e;">${configName} <span style="font-weight: normal; font-size: 0.9em; color: #586069;">${signature}</span></h3>
+            <div id="${configSectionAnchorId}" style="border: 2px solid #e1e4e8; border-radius: 8px; padding: 20px; margin-bottom: 40px; background-color: #ffffff; box-shadow: 0 2px 8px rgba(0,0,0,0.05);">
+                <h3 style="margin-top: 0; padding-bottom: 15px; border-bottom: 1px solid #e1e4e8; color: #24292e;">${configName}</h3>
                 ${configDisplay}
                 ${dllDisplayHtml}
                 ${groupSummaryHtml}
@@ -1334,7 +1554,11 @@ class WebNNRunner {
                         ${groupResults.map(result => {
                           const retryCount = result.retryHistory ? result.retryHistory.length - 1 : 0;
                           const retryInfo = retryCount > 0 ? `${retryCount} retry(ies)` : 'No retries';
-                          const statusColor = result.result === 'PASS' ? '#28a745' : result.result === 'FAIL' ? '#dc3545' : result.result === 'SKIP' ? '#6c757d' : '#fd7e14';
+                          const statusColor = result.result === 'PASS' ? '#28a745' :
+                                              result.result === 'FAIL' ? '#dc3545' :
+                                              result.result === 'CRASH' ? '#b03060' :
+                                              result.result === 'TIMEOUT' ? '#ff8c00' :
+                                              result.result === 'SKIP' ? '#6c757d' : '#fd7e14';
                           const statusStyle = `color: ${statusColor}; font-weight: bold;`;
                           const baseTdStyle = "border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left;";
 
@@ -1501,6 +1725,7 @@ class WebNNRunner {
     <table style="width: 100%; border-collapse: collapse; margin: 20px 0; font-family: sans-serif;">
         <thead>
             <tr>
+                <th style="border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left; background-color: #f6f8fa; font-weight: 600;">Backend</th>
                 <th style="border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left; background-color: #f6f8fa; font-weight: 600;">Test Case</th>
                 <th style="border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left; background-color: #f6f8fa; font-weight: 600;">Initial Status</th>
                 <th style="border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left; background-color: #f6f8fa; font-weight: 600;">Final Status</th>
@@ -1514,12 +1739,14 @@ class WebNNRunner {
               const final = result.retryHistory[result.retryHistory.length - 1];
               const retryCount = result.retryHistory.length - 1;
               const subcaseChange = final.passed !== initial.passed || final.failed !== initial.failed;
+              const retryBackend = formatBackendKey(resolveBackendName(result));
 
               const baseTdStyle = "border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left;";
               const getStatusColor = (status) => status === 'PASS' ? '#28a745' : status === 'FAIL' ? '#dc3545' : '#fd7e14';
 
               return `
                 <tr>
+                    <td style="${baseTdStyle}"><strong>${retryBackend}</strong></td>
                     <td style="${baseTdStyle}"><strong>${result.testName}</strong></td>
                     <td style="${baseTdStyle} font-weight: bold; color: ${getStatusColor(initial.status)};">${initial.status}<br><small style="font-weight: normal; color: #586069;">(${initial.passed}/${initial.total} passed)</small></td>
                     <td style="${baseTdStyle} font-weight: bold; color: ${getStatusColor(final.status)};">${final.status}<br><small style="font-weight: normal; color: #586069;">(${final.passed}/${final.total} passed)</small></td>
@@ -1533,7 +1760,7 @@ class WebNNRunner {
                     </td>
                 </tr>
                 <tr>
-                    <td colspan="5" style="padding: 0; border: 1px solid #e1e4e8;">
+                    <td colspan="6" style="padding: 0; border: 1px solid #e1e4e8;">
                         <details style="padding: 10px; background-color: #f6f8fa;">
                             <summary style="cursor: pointer; font-weight: bold;">View All Attempts</summary>
                             <div style="margin-top: 10px;">
@@ -1558,6 +1785,9 @@ class WebNNRunner {
 
 </body>
 </html>`;
+
+        // Defensive cleanup: remove legacy signature labels appended to section titles.
+        return reportHtml.replace(/\s*<span style="font-weight:\s*normal;\s*font-size:\s*0\.9em;\s*color:\s*#586069;">\[[^<]*\]<\/span>/g, '');
   }
 
   generateSubcaseTable(testSuites, results) {
@@ -1649,8 +1879,8 @@ class WebNNRunner {
                now.getSeconds().toString().padStart(2, '0');
       })();
 
-      // Create email subject: [WebNN Test Report] timestamp | machine name
-      const subject = `[WebNN Test Report] ${timestamp} | ${machineName}`;
+      // Create email subject: [machine name] WebNN Test Report - timestamp
+      const subject = `[${machineName}] WebNN Test Report - ${timestamp}`;
 
       // Use provided HTML content or generate new one
       const htmlBody = htmlReportContent || this.generateHtmlReport(testSuites, null, results, null, wallTime, sumOfTestTimes);
@@ -1704,7 +1934,7 @@ class WebNNPerfCollector {
           return true;
         });
       } catch (e) {
-        // Malformed payload — ignore
+        console.log(`[Debug] Ignoring malformed [WebNN:Perf] payload: ${e && e.message ? e.message : e}`);
       }
     };
 
@@ -1717,7 +1947,9 @@ class WebNNPerfCollector {
         if (!this._page.isClosed()) {
           this._page.removeListener('console', this._listener);
         }
-      } catch (e) { /* page may already be closed */ }
+      } catch (e) {
+        console.log(`[Debug] Failed to remove WebNN perf console listener: ${e && e.message ? e.message : e}`);
+      }
     }
     // Reject pending waiters
     this._waiters.forEach(w => w.reject(new Error('WebNNPerfCollector stopped')));
@@ -1815,4 +2047,4 @@ class WebNNPerfCollector {
   }
 }
 
-module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, findBrowserRootPid, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };
+module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, findBrowserRootPid, isGpuProcessAlive, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };

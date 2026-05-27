@@ -1,0 +1,16 @@
+[
+    {
+        "name": "ORT CI Default CPU",
+        "suite": "wpt",
+        "wpt-case": "add",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-library-path-for-testing=C:\\Program Files\\onnxruntime-ep-openvino-ci-develop-682 --webnn-ort-ep-device=CPUExecutionProvider,0x8086,0x7 --allow-third-party-modules"
+    },
+        {
+        "name": "ORT CI Default GPU",
+        "suite": "wpt",
+        "wpt-case": "add",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-library-path-for-testing=C:\\Program Files\\onnxruntime-ep-openvino-ci-develop-682 --webnn-ort-ep-device=DmlExecutionProvider,0x8086,0x7d51 --allow-third-party-modules"
+    }
+]
