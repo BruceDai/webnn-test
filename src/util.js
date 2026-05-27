@@ -285,9 +285,9 @@ ${content}
      try {
         if (os.platform() === 'win32') {
             // Try to find NPU devices from PnP entities.
-            // Common potential names: "Intel(R) AI Boost", "LNP", "NPU"
+            // Common potential names: "Intel(R) AI Boost", "Intel(R) NPU", "LNP", "NPU"
             // We use word boundary \bNPU\b to avoid matching "Input" (which contains "npu")
-            const cmd = 'powershell -c "Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -match \'\\\\bNPU\\\\b|AI Boost|Hexagon|Movidius\' } | Sort-Object -Property DriverDate -Descending | Select-Object DeviceName, DriverVersion, DeviceID, @{N=\'DriverDate\';E={if($_.DriverDate){([datetime]$_.DriverDate).ToString(\'yyyy/MM/dd\')}}} | ConvertTo-Json -Compress"';
+            const cmd = 'powershell -c "Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceName -match \'\\\\bNPU\\\\b|Intel.*AI Boost|Intel.*NPU|Hexagon|Movidius\' } | Sort-Object -Property DriverDate -Descending | Select-Object DeviceName, DriverVersion, DeviceID, @{N=\'DriverDate\';E={if($_.DriverDate){([datetime]$_.DriverDate).ToString(\'yyyy/MM/dd\')}}} | ConvertTo-Json -Compress"';
             const output = execSync(cmd, { encoding: 'utf8', timeout: 15000 }).trim();
             if (output) {
                 let npu = null;
@@ -317,17 +317,24 @@ ${content}
   }
 
 async function launchBrowser() {
+    // Ensure stale browser processes do not interfere with a new launch.
+    const browserProcessName = (() => {
+        const browserPath = (process.env.BROWSER_PATH || '').toLowerCase();
+        const channel = (process.env.CHROME_CHANNEL || '').toLowerCase();
+        if (browserPath.includes('msedge') || channel.includes('edge')) {
+            return 'msedge.exe';
+        }
+        return 'chrome.exe';
+    })();
+    try {
+        execSync(`taskkill /F /IM ${browserProcessName} /T`, { stdio: 'ignore', timeout: 10000 });
+        console.log(`[Info] Killed existing ${browserProcessName} processes before launch`);
+    } catch (e) {
+        // Best effort: process may not exist
+    }
+
     // Using flags found in current file + persistent context logic
-    const args = [
-       '--disable-gpu-watchdog',
-       //'--disable-web-security',
-       //'--ignore-certificate-errors',
-       '--enable-features=WebMachineLearningNeuralNetwork',
-       '--webnn-ort-ignore-ep-blocklist',
-       '--ignore-gpu-blocklist',
-       '--disable_webnn_for_npu=0',
-       //'--webnn-ort-logging-level=VERBOSE',
-   ];
+    const args = [];
 
    if (process.env.EXTRA_BROWSER_ARGS) {
        // Split by whitespace followed by -- to allow spaces in argument values
@@ -368,6 +375,7 @@ async function launchBrowser() {
        fs.mkdirSync(userDataDir, { recursive: true });
    }
 
+   console.log(`[Launch] Launch options: ${JSON.stringify(launchOptions)}`);
    console.log(`[Launch] Launching Chrome from: ${userDataDir}`);
 
    let context, page, browser;
@@ -793,8 +801,22 @@ class WebNNRunner {
     const failedSubcases = results.reduce((sum, r) => sum + r.subcases.failed, 0);
     const passed = results.filter(r => r.result === 'PASS').length;
     const failed = results.filter(r => r.result === 'FAIL').length;
+    const crashed = results.filter(r => r.result === 'CRASH').length;
     const errors = results.filter(r => r.result === 'ERROR').length;
     const skipped = results.filter(r => r.result === 'SKIP').length;
+
+    const toSafeText = (value) => {
+        const text = value == null ? '' : value.toString().trim();
+        return text;
+    };
+
+    const resolveBackendName = (r) => toSafeText(
+        r.configName || (r.fullConfig && r.fullConfig.name) || r.backend
+    );
+
+    const formatBackendKey = (value) => toSafeText(value)
+        .replace(/[^A-Za-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
 
     // Calculate overall regressions and improvements (case-level and subcase-level)
     const allRegressions = [];
@@ -804,13 +826,14 @@ class WebNNRunner {
         if (prev) {
             const isPass = r.result === 'PASS';
             const wasPass = prev === 'PASS';
-            const groupKey = `${r.framework}-${r.backend}-${r.deviceName || r.device || 'unknown'}`;
+            const backendName = formatBackendKey(resolveBackendName(r));
+            const groupKey = backendName;
             if (wasPass && !isPass) {
                 // Case-level regression
-                allRegressions.push({ name: r.testName, result: r.result, prev, group: groupKey, type: 'case' });
+                allRegressions.push({ name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'case' });
             } else if (!wasPass && isPass) {
                 // Case-level improvement
-                allImprovements.push({ name: r.testName, result: r.result, prev, group: groupKey, type: 'case' });
+                allImprovements.push({ name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'case' });
             } else if (r.previousSubcases && r.subcases && r.subcases.total > 0) {
                 // Same case-level result — check subcase-level changes
                 const prevSc = r.previousSubcases;
@@ -819,12 +842,12 @@ class WebNNRunner {
                     // New format: compare passed/total
                     if (curSc.passed < prevSc.passed || (curSc.passed === prevSc.passed && curSc.total > prevSc.total)) {
                         allRegressions.push({
-                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
                             subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`
                         });
                     } else if (curSc.passed > prevSc.passed || (curSc.passed === prevSc.passed && curSc.total < prevSc.total)) {
                         allImprovements.push({
-                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
                             subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`
                         });
                     }
@@ -834,12 +857,12 @@ class WebNNRunner {
                     const prevFailed = prevSc.failed || 0;
                     if (curFailed > prevFailed) {
                         allRegressions.push({
-                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
                             subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`
                         });
                     } else if (curFailed < prevFailed) {
                         allImprovements.push({
-                            name: r.testName, result: r.result, prev, group: groupKey, type: 'subcase',
+                            name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
                             subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`
                         });
                     }
@@ -857,6 +880,98 @@ class WebNNRunner {
     const suiteTitle = testSuites.length > 1 ?
       testSuites.map(s => s.toUpperCase()).join(', ') :
       testSuites[0].toUpperCase();
+
+    const makeAnchorId = (value) => toSafeText(value)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+
+    // Per-backend summary table shown at the top of the report.
+    const backendGroups = results.reduce((acc, r) => {
+        const key = formatBackendKey(resolveBackendName(r));
+        if (!acc[key]) acc[key] = [];
+        acc[key].push(r);
+        return acc;
+    }, {});
+
+    const backendSummaryRowsHtml = Object.entries(backendGroups).map(([backendName, group]) => {
+        const cases = group.length;
+        const passCases = group.filter(r => r.result === 'PASS').length;
+        const crashCases = group.filter(r => r.result === 'CRASH').length;
+        const failCases = group.filter(r => r.result !== 'PASS' && r.result !== 'SKIP').length;
+        const subcases = group.reduce((s, r) => s + (r.subcases ? r.subcases.total : 0), 0);
+        const passSubcases = group.reduce((s, r) => s + (r.subcases ? r.subcases.passed : 0), 0);
+        const failSubcases = group.reduce((s, r) => s + (r.subcases ? r.subcases.failed : 0), 0);
+        const successRate = subcases > 0 ? ((passSubcases / subcases) * 100).toFixed(1) : '0.0';
+        const detailAnchorId = `config-${makeAnchorId(backendName)}`;
+
+        return `
+        <tr>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px;"><strong><a href="#${detailAnchorId}" style="color: #0366d6; text-decoration: none;">${backendName}</a></strong></td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px;">${cases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: #28a745; font-weight: bold;">${passCases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: ${failCases > 0 ? '#dc3545' : '#586069'}; font-weight: bold;">${failCases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: ${crashCases > 0 ? '#b03060' : '#586069'}; font-weight: bold;">${crashCases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px;">${subcases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: #28a745; font-weight: bold;">${passSubcases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; color: ${failSubcases > 0 ? '#dc3545' : '#586069'}; font-weight: bold;">${failSubcases}</td>
+            <td style="border: 1px solid #e1e4e8; padding: 8px 10px; font-weight: bold; color: ${parseFloat(successRate) >= 100 ? '#28a745' : '#24292e'};">${successRate}%</td>
+        </tr>`;
+    }).join('');
+
+    const backendSummaryTableHtml = `
+        <div style="margin: 0 0 20px 0; padding: 12px; background-color: #f8fbff; border: 1px solid #c8e1ff; border-radius: 8px;">
+            <h3 style="margin: 0 0 10px 0; color: #0366d6;">Backend Summary</h3>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead>
+                    <tr>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Backend</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Cases</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Pass</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Fail</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Crash</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Subcases</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Pass</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Fail</th>
+                        <th style="border: 1px solid #c8e1ff; padding: 8px 10px; text-align: left; background-color: #eaf5ff;">Success Rate</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${backendSummaryRowsHtml}
+                </tbody>
+            </table>
+        </div>`;
+
+    // Build crash details grouped by backend for summary section.
+    const crashResults = results.filter(r => r.result === 'CRASH');
+    const crashGroups = crashResults.reduce((acc, r) => {
+        const configKey = formatBackendKey(resolveBackendName(r));
+        if (!acc[configKey]) acc[configKey] = [];
+        acc[configKey].push(r);
+        return acc;
+    }, {});
+
+    const crashTestsByBackendHtml = crashResults.length > 0 ? `
+        <div style="margin: 12px 0 20px 0; padding: 12px; background-color: #fff4fb; border: 1px solid #e3b5d5; border-radius: 8px;">
+            <h4 style="margin: 0 0 10px 0; color: #b03060;">Crash Tests By Configuration (${crashResults.length})</h4>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead>
+                    <tr>
+                        <th style="border: 1px solid #e3b5d5; padding: 6px 10px; text-align: left; background-color: #ffe6f3;">Configuration</th>
+                        <th style="border: 1px solid #e3b5d5; padding: 6px 10px; text-align: left; background-color: #ffe6f3;">Test Case</th>
+                        <th style="border: 1px solid #e3b5d5; padding: 6px 10px; text-align: left; background-color: #ffe6f3;">Message</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${Object.entries(crashGroups).map(([configName, items]) => items.map((item, idx) => `
+                    <tr>
+                        <td style="border: 1px solid #f2cfe3; padding: 6px 10px; vertical-align: top;">${idx === 0 ? `<strong>${configName}</strong> (${items.length})` : ''}</td>
+                        <td style="border: 1px solid #f2cfe3; padding: 6px 10px;">${item.testName || item.fileName || 'unknown'}</td>
+                        <td style="border: 1px solid #f2cfe3; padding: 6px 10px; color: #5f2120;">${(item.error || '').toString().slice(0, 500) || '-'}</td>
+                    </tr>`).join('')).join('')}
+                </tbody>
+            </table>
+        </div>` : '';
 
     // Device Info (CPU, GPU, NPU)
     let deviceInfoHtml = '';
@@ -961,7 +1076,7 @@ class WebNNRunner {
         }
     }
 
-    return `
+    const reportHtml = `
 <!DOCTYPE html>
 <html>
 <head>
@@ -993,7 +1108,67 @@ class WebNNRunner {
 
     ${deviceInfoHtml}
 
+    ${backendSummaryTableHtml}
+
+    ${crashTestsByBackendHtml}
+
     <div style="margin-bottom: 20px;">
+        ${baselineDirName && (totalRegressions > 0 || totalImprovements > 0) ? `
+        <div style="margin-bottom: 15px; padding: 12px; background-color: #e3f2fd; border-left: 4px solid #2196f3; border-radius: 4px; font-size: 14px;">
+            <strong>Baseline Comparison:</strong> Comparing against results from <code>${baselineDirName}</code>
+        </div>
+        <div style="margin-bottom: 20px;">
+            ${totalRegressions > 0 ? `
+            <div style="margin-bottom: 12px; padding: 15px; background-color: #fff5f5; border: 1px solid #f5c6cb; border-radius: 8px;">
+                <h4 style="margin: 0 0 10px 0; color: #dc3545;">\u25BC Regressions (${totalRegressions})</h4>
+                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                    <thead>
+                        <tr>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Backend</th>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Test Case</th>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Baseline</th>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Current</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${allRegressions.map(t => `
+                        <tr>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #586069;">${t.backendName || '-'}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
+                        </tr>`).join('')}
+                    </tbody>
+                </table>
+            </div>
+            ` : ''}
+            ${totalImprovements > 0 ? `
+            <div style="margin-bottom: 12px; padding: 15px; background-color: #f0fff4; border: 1px solid #c3e6cb; border-radius: 8px;">
+                <h4 style="margin: 0 0 10px 0; color: #28a745;">\u25B2 Improvements (${totalImprovements})</h4>
+                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                    <thead>
+                        <tr>
+                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Backend</th>
+                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Test Case</th>
+                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Baseline</th>
+                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Current</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${allImprovements.map(t => `
+                        <tr>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #586069;">${t.backendName || '-'}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
+                        </tr>`).join('')}
+                    </tbody>
+                </table>
+            </div>
+            ` : ''}
+        </div>
+        ` : ''}
+
         <h3>Summary</h3>
         <table style="width: 100%; border-collapse: separate; border-spacing: 12px; margin-bottom: 20px;">
             <tr>
@@ -1038,6 +1213,20 @@ class WebNNRunner {
                     <div style="color: #586069; font-size: 14px; font-weight: 500;">Sum of Test Times</div>
                 </td>
             </tr>
+            <tr>
+                <td style="text-align: center; padding: 20px; background-color: ${crashed > 0 ? '#fff4fb' : '#ffffff'}; border: 1px solid ${crashed > 0 ? '#e3b5d5' : '#e1e4e8'}; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                    <div style="font-size: 28px; font-weight: bold; margin-bottom: 8px; color: ${crashed > 0 ? '#b03060' : '#586069'};">${crashed}</div>
+                    <div style="color: #586069; font-size: 14px; font-weight: 500;">Crash Cases</div>
+                </td>
+                <td style="text-align: center; padding: 20px; background-color: ${errors > 0 ? '#fff8f0' : '#ffffff'}; border: 1px solid ${errors > 0 ? '#ffd8a8' : '#e1e4e8'}; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                    <div style="font-size: 28px; font-weight: bold; margin-bottom: 8px; color: ${errors > 0 ? '#fd7e14' : '#586069'};">${errors}</div>
+                    <div style="color: #586069; font-size: 14px; font-weight: 500;">Error Cases</div>
+                </td>
+                <td style="text-align: center; padding: 20px; background-color: ${skipped > 0 ? '#f8f9fa' : '#ffffff'}; border: 1px solid ${skipped > 0 ? '#ced4da' : '#e1e4e8'}; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
+                    <div style="font-size: 28px; font-weight: bold; margin-bottom: 8px; color: ${skipped > 0 ? '#6c757d' : '#586069'};">${skipped}</div>
+                    <div style="color: #586069; font-size: 14px; font-weight: 500;">Skipped Cases</div>
+                </td>
+            </tr>
             ${baselineDirName ? `
             <tr>
                 <td style="text-align: center; padding: 20px; background-color: ${totalRegressions > 0 ? '#fff5f5' : '#ffffff'}; border: 1px solid ${totalRegressions > 0 ? '#f5c6cb' : '#e1e4e8'}; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.05);">
@@ -1055,61 +1244,7 @@ class WebNNRunner {
             </tr>
             ` : ''}
         </table>
-        ${baselineDirName && (totalRegressions > 0 || totalImprovements > 0) ? `
-        <div style="margin-bottom: 15px; padding: 12px; background-color: #e3f2fd; border-left: 4px solid #2196f3; border-radius: 4px; font-size: 14px;">
-            <strong>Baseline Comparison:</strong> Comparing against results from <code>${baselineDirName}</code>
-        </div>
-        <div style="margin-bottom: 20px;">
-            ${totalRegressions > 0 ? `
-            <div style="margin-bottom: 12px; padding: 15px; background-color: #fff5f5; border: 1px solid #f5c6cb; border-radius: 8px;">
-                <h4 style="margin: 0 0 10px 0; color: #dc3545;">\u25BC Regressions (${totalRegressions})</h4>
-                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-                    <thead>
-                        <tr>
-                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Test Case</th>
-                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Configuration</th>
-                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Baseline</th>
-                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Current</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${allRegressions.map(t => `
-                        <tr>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #586069;">${t.group}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
-                        </tr>`).join('')}
-                    </tbody>
-                </table>
-            </div>
-            ` : ''}
-            ${totalImprovements > 0 ? `
-            <div style="margin-bottom: 12px; padding: 15px; background-color: #f0fff4; border: 1px solid #c3e6cb; border-radius: 8px;">
-                <h4 style="margin: 0 0 10px 0; color: #28a745;">\u25B2 Improvements (${totalImprovements})</h4>
-                <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-                    <thead>
-                        <tr>
-                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Test Case</th>
-                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Configuration</th>
-                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Baseline</th>
-                            <th style="border: 1px solid #c3e6cb; padding: 6px 10px; text-align: left; background-color: #d4edda;">Current</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        ${allImprovements.map(t => `
-                        <tr>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #586069;">${t.group}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
-                            <td style="border: 1px solid #c3e6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
-                        </tr>`).join('')}
-                    </tbody>
-                </table>
-            </div>
-            ` : ''}
-        </div>
-        ` : ''}
+
     </div>
 
     <h3>Detailed Test Results</h3>
@@ -1119,9 +1254,9 @@ class WebNNRunner {
             const cName = r.configName || 'Default';
             // Group by Config + Device (and backend/framework to be safe for unique tables)
             // Using signature parts ensures separation requested
-            const device = (r.deviceName || r.device || 'unknown').toLowerCase();
-            const framework = (r.framework || 'unknown').toLowerCase();
-            const backend = (r.backend || 'unknown').toLowerCase();
+            const device = toSafeText(r.deviceName || r.device).toLowerCase();
+            const framework = toSafeText(r.framework).toLowerCase();
+            const backend = toSafeText(r.backend).toLowerCase();
 
             const key = `${cName}::${framework}::${backend}::${device}`;
 
@@ -1199,15 +1334,11 @@ class WebNNRunner {
             const wptCaseStr = uniqueConfigValues('wptCase');
             const modelCaseStr = uniqueConfigValues('modelCase');
 
-            // Derive the signature from the first result (assuming config group maps to one signature)
-            // Or if multiple, display primary one
-            const r0 = groupResults[0];
-            const signature = `[${r0.framework || '?'} - ${r0.backend || '?'} - ${r0.deviceName || r0.device || '?'}]`;
-
             // Calculate Group Summary
             const groupTotal = groupResults.length;
             const groupPassed = groupResults.filter(r => r.result === 'PASS').length;
             const groupFailed = groupResults.filter(r => r.result === 'FAIL').length;
+            const groupCrashed = groupResults.filter(r => r.result === 'CRASH').length;
             const groupErrors = groupResults.filter(r => r.result === 'ERROR').length;
             const groupSkipped = groupResults.filter(r => r.result === 'SKIP').length;
             const groupTotalSubcases = groupResults.reduce((s,r)=>s+r.subcases.total,0);
@@ -1256,6 +1387,7 @@ class WebNNRunner {
                  <div style="font-weight: bold; color: #24292e;">Cases: ${groupTotal}</div>
                  <div style="font-weight: bold; color: #28a745;">Pass: ${groupPassed}</div>
                  <div style="font-weight: bold; color: #dc3545;">Fail: ${groupFailed}</div>
+                  ${groupCrashed > 0 ? `<div style="font-weight: bold; color: #b03060;">Crash: ${groupCrashed}</div>` : ''}
                  ${groupErrors > 0 ? `<div style="font-weight: bold; color: #fd7e14;">Error: ${groupErrors}</div>` : ''}
                  ${groupSkipped > 0 ? `<div style="font-weight: bold; color: #6c757d;">Skip: ${groupSkipped}</div>` : ''}
                  <div style="width: 1px; background-color: #e1e4e8; margin: 0 5px;"></div>
@@ -1307,9 +1439,11 @@ class WebNNRunner {
                 </div>
             </div>`;
 
+            const configSectionAnchorId = `config-${makeAnchorId(configName)}`;
+
             return `
-            <div style="border: 2px solid #e1e4e8; border-radius: 8px; padding: 20px; margin-bottom: 40px; background-color: #ffffff; box-shadow: 0 2px 8px rgba(0,0,0,0.05);">
-                <h3 style="margin-top: 0; padding-bottom: 15px; border-bottom: 1px solid #e1e4e8; color: #24292e;">${configName} <span style="font-weight: normal; font-size: 0.9em; color: #586069;">${signature}</span></h3>
+            <div id="${configSectionAnchorId}" style="border: 2px solid #e1e4e8; border-radius: 8px; padding: 20px; margin-bottom: 40px; background-color: #ffffff; box-shadow: 0 2px 8px rgba(0,0,0,0.05);">
+                <h3 style="margin-top: 0; padding-bottom: 15px; border-bottom: 1px solid #e1e4e8; color: #24292e;">${configName}</h3>
                 ${configDisplay}
                 ${dllDisplayHtml}
                 ${groupSummaryHtml}
@@ -1334,7 +1468,11 @@ class WebNNRunner {
                         ${groupResults.map(result => {
                           const retryCount = result.retryHistory ? result.retryHistory.length - 1 : 0;
                           const retryInfo = retryCount > 0 ? `${retryCount} retry(ies)` : 'No retries';
-                          const statusColor = result.result === 'PASS' ? '#28a745' : result.result === 'FAIL' ? '#dc3545' : result.result === 'SKIP' ? '#6c757d' : '#fd7e14';
+                          const statusColor = result.result === 'PASS' ? '#28a745' :
+                                              result.result === 'FAIL' ? '#dc3545' :
+                                              result.result === 'CRASH' ? '#b03060' :
+                                              result.result === 'TIMEOUT' ? '#ff8c00' :
+                                              result.result === 'SKIP' ? '#6c757d' : '#fd7e14';
                           const statusStyle = `color: ${statusColor}; font-weight: bold;`;
                           const baseTdStyle = "border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left;";
 
@@ -1501,6 +1639,7 @@ class WebNNRunner {
     <table style="width: 100%; border-collapse: collapse; margin: 20px 0; font-family: sans-serif;">
         <thead>
             <tr>
+                <th style="border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left; background-color: #f6f8fa; font-weight: 600;">Backend</th>
                 <th style="border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left; background-color: #f6f8fa; font-weight: 600;">Test Case</th>
                 <th style="border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left; background-color: #f6f8fa; font-weight: 600;">Initial Status</th>
                 <th style="border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left; background-color: #f6f8fa; font-weight: 600;">Final Status</th>
@@ -1514,12 +1653,14 @@ class WebNNRunner {
               const final = result.retryHistory[result.retryHistory.length - 1];
               const retryCount = result.retryHistory.length - 1;
               const subcaseChange = final.passed !== initial.passed || final.failed !== initial.failed;
+              const retryBackend = formatBackendKey(resolveBackendName(result));
 
               const baseTdStyle = "border: 1px solid #e1e4e8; padding: 8px 12px; text-align: left;";
               const getStatusColor = (status) => status === 'PASS' ? '#28a745' : status === 'FAIL' ? '#dc3545' : '#fd7e14';
 
               return `
                 <tr>
+                    <td style="${baseTdStyle}"><strong>${retryBackend}</strong></td>
                     <td style="${baseTdStyle}"><strong>${result.testName}</strong></td>
                     <td style="${baseTdStyle} font-weight: bold; color: ${getStatusColor(initial.status)};">${initial.status}<br><small style="font-weight: normal; color: #586069;">(${initial.passed}/${initial.total} passed)</small></td>
                     <td style="${baseTdStyle} font-weight: bold; color: ${getStatusColor(final.status)};">${final.status}<br><small style="font-weight: normal; color: #586069;">(${final.passed}/${final.total} passed)</small></td>
@@ -1533,7 +1674,7 @@ class WebNNRunner {
                     </td>
                 </tr>
                 <tr>
-                    <td colspan="5" style="padding: 0; border: 1px solid #e1e4e8;">
+                    <td colspan="6" style="padding: 0; border: 1px solid #e1e4e8;">
                         <details style="padding: 10px; background-color: #f6f8fa;">
                             <summary style="cursor: pointer; font-weight: bold;">View All Attempts</summary>
                             <div style="margin-top: 10px;">
@@ -1558,6 +1699,9 @@ class WebNNRunner {
 
 </body>
 </html>`;
+
+    // Defensive cleanup: remove legacy signature labels appended to section titles.
+    return reportHtml.replace(/\s*<span style="font-weight:\s*normal;\s*font-size:\s*0\.9em;\s*color:\s*#586069;">\[[^<]*\]<\/span>/g, '');
   }
 
   generateSubcaseTable(testSuites, results) {
@@ -1650,7 +1794,7 @@ class WebNNRunner {
       })();
 
       // Create email subject: [WebNN Test Report] timestamp | machine name
-      const subject = `[WebNN Test Report] ${timestamp} | ${machineName}`;
+      const subject = `[${machineName}]WebNN Test Report - ${timestamp}`;
 
       // Use provided HTML content or generate new one
       const htmlBody = htmlReportContent || this.generateHtmlReport(testSuites, null, results, null, wallTime, sumOfTestTimes);

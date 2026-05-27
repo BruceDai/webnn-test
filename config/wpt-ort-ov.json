@@ -1,0 +1,23 @@
+[
+    {
+        "name": "ORT OV CPU",
+        "suite": "wpt",
+        "wpt-case": "add",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork"
+    },
+    {
+        "name": "ORT OV GPU",
+        "suite": "wpt",
+        "wpt-case": "add",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork"
+    },
+    {
+        "name": "ORT OV NPU",
+        "suite": "wpt",
+        
+        "device": "npu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork"
+    }
+]

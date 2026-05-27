@@ -1,0 +1,16 @@
+[
+    {
+        "name": "LiteRT XNNPACK CPU",
+        "suite": "wpt",
+        "wpt-case": "pad",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork,WebNNLiteRT --disable-features=WebNNOnnxRuntime"
+    },
+    {
+        "name": "LiteRT MLDrift GPU",
+        "suite": "wpt",
+        "wpt-case": "pad",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork,WebNNLiteRT --disable-features=WebNNOnnxRuntime"
+    }
+]
