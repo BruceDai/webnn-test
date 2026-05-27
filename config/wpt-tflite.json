@@ -1,0 +1,16 @@
+[
+    {
+        "name": "TFLite XNNPACK CPU",
+        "suite": "wpt",
+        "wpt-case": "pad",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-ep-library-path-for-testing=OpenVINOExecutionProvider?fakepath"
+    },
+    {
+        "name": "TFLite MLDrift GPU",
+        "suite": "wpt",
+        "wpt-case": "pad",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-ep-library-path-for-testing=OpenVINOExecutionProvider?fakepath"
+    }
+]

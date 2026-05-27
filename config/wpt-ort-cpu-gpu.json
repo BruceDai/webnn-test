@@ -1,0 +1,16 @@
+[
+    {
+        "name": "ORT Default CPU",
+        "suite": "wpt",
+        "wpt-case": "add",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-ignore-ihv-eps"
+    },
+    {
+        "name": "ORT Default GPU",
+        "suite": "wpt",
+        "wpt-case": "add",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-ignore-ihv-eps"
+    }
+]

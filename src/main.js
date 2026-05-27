@@ -15,15 +15,10 @@ const { getRuntimeInfo, runtimeInfoRows, resolveWindowsAppSdk, verifyWindowsAppS
 const parseList = (str) => (str || '').split(',').map(s => s.trim()).filter(s => s.length > 0);
 
 // Helper to identify framework and backend
-const getFramework = (browserArgs) => (browserArgs || '').includes('WebNNOnnxRuntime') ? 'ort' : 'litert';
+const getFramework = (browserArgs) => (browserArgs || '').includes('WebNNLiteRT') ? 'litert' : 'ort';
 const getBackend = (framework, browserArgs, dllResults, device) => {
     // If device is cpu, backend has to be cpu
     if (device === 'cpu') return 'cpu';
-
-    // If DLL check explicitly failed or found nothing, and we are expecting acceleration, fallback to cpu
-    if (dllResults && dllResults.found === false && framework === 'ort') {
-        return 'cpu';
-    }
 
     // Checking DLL naming for backend detection
     if (framework === 'ort' && dllResults && dllResults.modules && dllResults.modules.length > 0) {
@@ -38,14 +33,13 @@ const getBackend = (framework, browserArgs, dllResults, device) => {
     }
 
     const args = browserArgs || '';
-    if (framework === 'litert') return 'cpu'; // Default for litert
     if (args.includes('WebGpuExecutionProvider')) return 'webgpu';
     if (args.includes('OpenVINO')) return 'openvino';
     if (args.includes('Qnn')) return 'qnn';
     if (args.includes('Dml')) return 'dml';
     if (args.includes('MigraphX')) return 'migraphx';
     if (args.includes('Tensorrt')) return 'tensorrt';
-    return 'cpu'; // Default fallback
+    return device;
 };
 
 const getBrowserProcessName = () => {
@@ -172,6 +166,7 @@ Examples:
   const skipRetry = args.includes('--skip-retry');
   const baseline = getArg('--baseline');
   const configFile = getArg('--config');
+  const configFileName = configFile ? path.basename(configFile) : 'cli';
   const pauseCase = getArg('--pause');
   const wptRange = getArg('--wpt-range');
 
@@ -244,6 +239,7 @@ Examples:
   process.env.BROWSER_CHANNEL = playwrightChannel;
   process.env.TEST_CONFIG_LIST = JSON.stringify(runConfigs);
   process.env.IS_LIST_MODE = process.env.LIST_MODE;
+  process.env.CURRENT_CONFIG_FILE_NAME = configFileName;
   if (emailAddress) {
       process.env.EMAIL_ADDRESS = emailAddress;
       process.env.EMAIL_TO = emailAddress;
@@ -396,6 +392,12 @@ Examples:
           });
       } else {
           test('Run Configured Tests', async () => {
+              // Launch once per Playwright test. Per-config relaunch still happens below for isolation.
+              const initialInstance = await launchInstance();
+              browser = initialInstance.browser || initialInstance.context;
+              context = initialInstance.context;
+              page = initialInstance.page;
+
               const configs = JSON.parse(process.env.TEST_CONFIG_LIST || '[]');
               let results = [];
               let runner = null;
@@ -418,6 +420,7 @@ Examples:
                    console.log(`\n=== Running Config: ${config.name} (Suite: ${config.suite}, Device: ${config.device}) ===`);
                    let currentDllResults = null;
 
+                   process.env.CURRENT_CONFIG_NAME = config.name || '';
                    process.env.EXTRA_BROWSER_ARGS = config.browserArgs || '';
                    process.env.DEVICE = config.device;
 
@@ -721,7 +724,7 @@ Examples:
 
                    // --- Generate Plain Text Results ---
                    try {
-                       // Group results by unique framework-backend-device combination
+                       // Group results by configured backend name (config name).
                        const groups = {};
                        // Retrieve system HW Info once (already done above)
 
@@ -749,7 +752,10 @@ Examples:
                        sysInfoText += '==========================\n';
 
                        results.forEach(r => {
-                           const key = `${r.framework}-${r.backend}-${r.deviceName}`;
+                           const keySource = r.configName ||
+                               (r.fullConfig && r.fullConfig.name) ||
+                               `${r.framework}-${r.backend}-${r.deviceName || r.device}`;
+                           const key = keySource.toString().trim();
                            if (!groups[key]) groups[key] = [];
                            groups[key].push(r);
                        });

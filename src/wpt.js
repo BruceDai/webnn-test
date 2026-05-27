@@ -1,8 +1,59 @@
 
 const { test } = require('@playwright/test');
+const fs = require('fs');
+const path = require('path');
 const { WebNNRunner } = require('./util');
 
 class WptRunner extends WebNNRunner {
+    writeFinalResultsCsv(results) {
+        const csvEscape = (value) => {
+            const text = value == null ? '' : String(value);
+            return `"${text.replace(/"/g, '""')}"`;
+        };
+
+        const getMessage = (result) => {
+            if (result.error) return result.error;
+            if (Array.isArray(result.failedSubtests) && result.failedSubtests.length > 0) {
+                return result.failedSubtests
+                    .map(s => `${s.name || 'subtest'}: ${s.message || s.status || 'FAIL'}`)
+                    .join(' | ');
+            }
+            return '';
+        };
+
+        const lines = [];
+        lines.push(['Backend', 'Test Suite', 'Test Case', 'Status', 'Message'].map(csvEscape).join(','));
+
+        const backend = (process.env.CURRENT_CONFIG_NAME || '').trim() || 'UNKNOWN';
+
+        for (const r of results) {
+            lines.push([
+                backend,
+                'WPT',
+                r.testName || r.fileName || '',
+                r.result || 'UNKNOWN',
+                getMessage(r)
+            ].map(csvEscape).join(','));
+        }
+
+        const runDir = process.env.PROJECT_RUN_DIR || path.join(__dirname, '..', 'results');
+        const timestamp = process.env.PROJECT_TIMESTAMP;
+        const configFileName = (process.env.CURRENT_CONFIG_FILE_NAME || '').trim() || 'config';
+        const configBaseName = configFileName.replace(/\.[^/.\\]+$/, '');
+        const safeConfigName = configBaseName
+            .replace(/[<>:"/\\|?*]/g, '_')
+            .replace(/\s+/g, '_')
+            .trim();
+        const configNamePart = safeConfigName || 'wpt-ort-cpu-gpu';
+        const fileName = timestamp
+            ? `${timestamp}-${configNamePart}-results.csv`
+            : `${configNamePart}-results.csv`;
+        const filePath = path.join(runDir, fileName);
+
+        fs.writeFileSync(filePath, lines.join('\n') + '\n', 'utf8');
+        console.log(`[Report] WPT CSV generated: ${filePath}`);
+    }
+
   async runWptTests(context, browser, onFirstCaseComplete) {
     // Configuration
     const wptCase = process.env.WPT_CASE;
@@ -78,6 +129,21 @@ class WptRunner extends WebNNRunner {
     let currentContext = context;
     let currentBrowser = browser;
     let isRestarting = false;
+    const enableGpuCrashLogHandler = jobs === 1;
+    let lastGpuCrashCount = 0;
+
+    if (enableGpuCrashLogHandler) {
+        try {
+            if (currentContext) {
+                const baselineLog = await this.getGpuCrashLogInfo(currentContext);
+                lastGpuCrashCount = baselineLog.crashCount;
+            }
+        } catch (e) {
+            console.log(`[Warning] Failed to initialize GPU crash log baseline: ${e.message}`);
+        }
+    } else {
+        console.log('[Info] GPU crash log handler disabled because jobs > 1.');
+    }
 
     const chunkedExec = async (files) => {
         let index = 0;
@@ -94,24 +160,61 @@ class WptRunner extends WebNNRunner {
                 await test.step(`Test: ${testFile}`, async () => {
                      let page = null;
                      try {
-                         // Ensure context exists
-                         if (!currentContext && !isRestarting) {
-                             // Should not happen if logic is correct, but safe check
-                             console.warn("No context available, waiting...");
-                             return;
+                         // For isolation: kill/relaunch browser for every conformance test.
+                         while (isRestarting) await new Promise(r => setTimeout(r, 100));
+                         isRestarting = true;
+                         try {
+                             const instance = await this.restartBrowserAndContext(currentBrowser);
+                             currentBrowser = instance.browser || instance.context;
+                             currentContext = instance.context;
+                             this.page = instance.page;
+                         } finally {
+                             isRestarting = false;
+                         }
+
+                         if (!currentContext) {
+                             throw new Error('No browser context available after relaunch');
                          }
 
                          page = await currentContext.newPage();
                          // Run test (Attempt 0)
                          const start = Date.now();
-                         const res = await this.runSingleWptTest(page, testFile, i, files.length, 0);
+                         const res = await Promise.race([
+                             this.runSingleWptTest(page, testFile, i, files.length, 0),
+                             new Promise((_, reject) => {
+                                 const timeoutError = new Error('Test timeout 120000ms exceeded');
+                                 timeoutError.name = 'ChunkedExecTimeoutError';
+                                 setTimeout(() => reject(timeoutError), 120000);
+                             })
+                         ]);
                          res.executionTime = ((Date.now() - start) / 1000).toFixed(2);
                          res.fileName = testFile; // Store filename for retry
+
+                         if (enableGpuCrashLogHandler) {
+                             // Check chrome://gpu log messages and mark this test as crash if a new crash log appeared.
+                             const gpuLog = await this.getGpuCrashLogInfo(currentContext);
+                             if (gpuLog.crashCount > lastGpuCrashCount) {
+                                 const crashLabel = '[CRASH]';
+                                 const crashDetails = Array.isArray(gpuLog.crashDetails) && gpuLog.crashDetails.length > 0
+                                     ? ` Details: ${gpuLog.crashDetails.join(' || ')}`
+                                     : '';
+                                 res.crashed = true;
+                                 res.result = 'CRASH';
+                                 res.error = res.error
+                                     ? `${crashLabel} ${res.error}${crashDetails}`
+                                     : `${crashLabel} GPU process crash detected from chrome://gpu logs${crashDetails}`;
+                                 console.log(`[Fail] ${crashLabel} ${testFile}: GpuProcessHost crash detected in chrome://gpu logs.`);
+                             }
+                             lastGpuCrashCount = Math.max(lastGpuCrashCount, gpuLog.crashCount);
+                         }
+
                          results.push(res);
                          if (results.length === 1 && onFirstCaseComplete) {
                              await onFirstCaseComplete();
                          }
                      } catch (e) {
+                         const isTimeoutError = e.name === 'ChunkedExecTimeoutError' ||
+                                              (e.message && e.message.includes('120000ms'));
                          const isCriticalError = e.message === 'GPUContextCreationError' ||
                                                e.message === 'HarnessError' ||
                                                e.message.includes('Protocol error') ||
@@ -122,21 +225,50 @@ class WptRunner extends WebNNRunner {
                                                e.message.includes('Timeout') ||
                                                e.name === 'TimeoutError';
 
+                         if (isTimeoutError) {
+                             console.log(`[Fail] Timeout for ${testFile} (${e.message}). Marking as TIMEOUT and restarting browser...`);
+
+                             results.push({
+                                 testName: testFile,
+                                 fileName: testFile,
+                                 suite: 'WPT',
+                                 result: 'TIMEOUT',
+                                 subcases: { total: 1, passed: 0, failed: 1 },
+                                 error: e.message
+                             });
+
+                             if (!isRestarting) {
+                                 isRestarting = true;
+                                 try {
+                                     const instance = await this.restartBrowserAndContext(currentBrowser);
+                                     currentBrowser = instance.browser || instance.context;
+                                     currentContext = instance.context;
+                                     this.page = instance.page;
+                                 } catch (restartError) {
+                                     console.error(`[Fail] Fatal error restarting browser after timeout: ${restartError.message}`);
+                                 } finally {
+                                     isRestarting = false;
+                                 }
+                             }
+                         }
+
                          // Handle Critical Context Errors (GPU, Protocol, Harness, etc.)
-                         if (isCriticalError) {
+                         else if (isCriticalError) {
                              let errorType = 'Browser/Protocol Error';
                              if (e.message === 'GPUContextCreationError') errorType = 'GPU Context Creation Failed';
                              else if (e.message === 'HarnessError') errorType = 'Harness Error (Restarting)';
+                             const crashLabel = '[CRASH]';
 
                              console.log(`[Fail] ${errorType} for ${testFile} (${e.message}). Triggering browser restart...`);
 
                              results.push({
-                                 testName: testFile, // Fallback name
+                                 testName: `${crashLabel} ${testFile}`,
                                  fileName: testFile,
                                  suite: 'WPT',
-                                 result: 'FAIL',
+                                 result: 'CRASH',
                                  subcases: {total:1, passed:0, failed:1},
-                                 error: errorType
+                                 error: `${crashLabel} ${errorType}`,
+                                 crashed: true
                              });
 
                              // Acquire lock to restart
@@ -162,7 +294,7 @@ class WptRunner extends WebNNRunner {
                                  fileName: testFile,
                                  suite: 'WPT',
                                  result: 'ERROR',
-                                 subcases: {total:0, passed:0, failed:0},
+                                 subcases: {total:1, passed:0, failed:1},
                                  error: e.message
                              });
                          }
@@ -217,8 +349,8 @@ class WptRunner extends WebNNRunner {
                     attempt: 0,
                     status: result.result,
                     passed: result.subcases ? result.subcases.passed : 0,
-                    failed: result.subcases ? result.subcases.failed : 0,
-                    total: result.subcases ? result.subcases.total : 0
+                    failed: result.subcases ? result.subcases.failed : 1,
+                    total: result.subcases ? result.subcases.total : 1
                 }];
 
                 console.log(`\n[Retry] [${i+1}/${failures.length}] Retrying: ${result.testName}`);
@@ -231,6 +363,24 @@ class WptRunner extends WebNNRunner {
                         const retryPage = retryInstance.page;
 
                         const res = await this.runSingleWptTest(retryPage, testFile, -1, -1, attempt);
+
+                        // Retry crash detection: mark explicit crash when chrome://gpu reports a GPU crash.
+                        try {
+                            const retryGpuLog = await this.getGpuCrashLogInfo(retryInstance.context);
+                            if (retryGpuLog.crashCount > 0) {
+                                const crashLabel = '[CRASH]';
+                                const crashDetails = Array.isArray(retryGpuLog.crashDetails) && retryGpuLog.crashDetails.length > 0
+                                    ? ` Details: ${retryGpuLog.crashDetails.join(' || ')}`
+                                    : '';
+                                res.result = 'CRASH';
+                                res.crashed = true;
+                                res.error = res.error
+                                    ? `${crashLabel} ${res.error}${crashDetails}`
+                                    : `${crashLabel} GPU process crash detected from chrome://gpu logs during retry${crashDetails}`;
+                            }
+                        } catch (_) {
+                            // Best effort only; retry result parsing should continue.
+                        }
 
                         retryHistory.push({
                             attempt,
@@ -255,13 +405,34 @@ class WptRunner extends WebNNRunner {
                                  break;
                              }
                              // Update result to latest failure
+                             result.result = res.result;
                              result.subcases = res.subcases;
-                             // result.error = res.error; // Update error?
+                             result.error = res.error;
+                             result.crashed = !!res.crashed;
                         }
 
                     } catch (e) {
-                        console.error(`[Fail] Error during retry ${attempt}: ${e.message}`);
-                        retryHistory.push({ attempt, status: 'ERROR', error: e.message });
+                        const isCriticalError = e.message === 'GPUContextCreationError' ||
+                                              e.message === 'HarnessError' ||
+                                              e.message.includes('Protocol error') ||
+                                              e.message.includes('Target.createTarget') ||
+                                              e.message.includes('Target.close') ||
+                                              e.message.includes('browserContext.newPage') ||
+                                              e.message.includes('Target closed') ||
+                                              e.message.includes('Timeout') ||
+                                              e.name === 'TimeoutError';
+
+                        if (isCriticalError) {
+                            const crashLabel = '[CRASH]';
+                            console.error(`[Fail] ${crashLabel} Error during retry ${attempt}: ${e.message}`);
+                            result.result = 'CRASH';
+                            result.error = `${crashLabel} ${e.message}`;
+                            result.crashed = true;
+                            retryHistory.push({ attempt, status: 'CRASH', error: e.message });
+                        } else {
+                            console.error(`[Fail] Error during retry ${attempt}: ${e.message}`);
+                            retryHistory.push({ attempt, status: 'ERROR', error: e.message });
+                        }
                     } finally {
                         if (retryInstance) {
                             try {
@@ -278,7 +449,69 @@ class WptRunner extends WebNNRunner {
         }
     }
 
-    return results;
+        this.writeFinalResultsCsv(results);
+        return results;
+  }
+
+  async getGpuCrashLogInfo(context) {
+    let gpuPage = null;
+    const crashPattern = 'GpuProcessHost: The GPU process crashed!';
+
+    try {
+        gpuPage = await context.newPage();
+        await gpuPage.goto('chrome://gpu', { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await gpuPage.waitForTimeout(1000);
+
+        const crashInfo = await gpuPage.evaluate((pattern) => {
+            const infoViewHost = document.querySelector('info-view');
+            if (!infoViewHost || !infoViewHost.shadowRoot) {
+                return { crashLines: [], crashDetails: [] };
+            }
+
+            const gpuLogMessages = Array.from(
+                infoViewHost.shadowRoot.querySelectorAll('#content > div:last-child > ul > li')
+            ).map((el) => (el.innerText || '').trim());
+
+            const crashLines = [];
+            const crashDetails = [];
+            const contextDepth = 3;
+
+            for (let i = 0; i < gpuLogMessages.length; i++) {
+                const line = gpuLogMessages[i];
+                if (!line || !line.includes(pattern)) continue;
+
+                crashLines.push(line);
+
+                const start = Math.max(0, i - contextDepth);
+                const preLines = gpuLogMessages.slice(start, i).filter(Boolean);
+                const detail = preLines.length > 0 ? `${preLines.join(' | ')} -> ${line}` : line;
+                crashDetails.push(detail);
+            }
+
+            return { crashLines, crashDetails };
+        }, crashPattern);
+
+        const crashLines = crashInfo.crashLines || [];
+        const crashDetails = crashInfo.crashDetails || [];
+
+        console.log(`[Info] Checked chrome://gpu logs. Crash count: ${crashLines.length} ${crashDetails}`);
+        return {
+            crashCount: crashLines.length,
+            crashLines,
+            crashDetails
+        };
+    } catch (e) {
+        return {
+            crashCount: 0,
+            crashLines: [],
+            crashDetails: [],
+            error: e.message
+        };
+    } finally {
+        if (gpuPage && !gpuPage.isClosed()) {
+            try { await gpuPage.close(); } catch (e) {}
+        }
+    }
   }
 
   // Removed runTestWithRetry as it's replaced by the retry logic above

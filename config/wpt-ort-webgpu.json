@@ -1,0 +1,9 @@
+[
+    {
+        "name": "ORT WebGPU",
+        "suite": "wpt",
+        "wpt-case": "add,hard_swish,sigmoid",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-library-path-for-testing=C:\\Program Files\\ORT-WebGPU_73d5416 --webnn-ort-ep-device=WebGpuExecutionProvider,0x8086,0x7d51 --allow-third-party-modules --webnn-ort-logging-level=VERBOSE --enable-logging --log-level=2"
+    }
+]
