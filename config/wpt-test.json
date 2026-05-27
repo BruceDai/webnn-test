@@ -70,5 +70,5 @@
         "suite": "wpt",
         "device": "npu",
         "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-library-path-for-testing=C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705 --webnn-ort-ep-library-path-for-testing=OpenVINOExecutionProvider?C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705\\onnxruntime_providers_openvino_plugin.dll --webnn-ort-ep-device=OpenVINOExecutionProvider,0x8086,0x --allow-third-party-modules"
-    }
+   }
 ]
