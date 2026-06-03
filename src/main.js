@@ -134,7 +134,7 @@ Examples:
     if (emailIdx + 1 < args.length && !args[emailIdx + 1].startsWith("--")) {
       emailAddress = args[emailIdx + 1];
     } else {
-      emailAddress = "feng.dai@intel.com";
+      emailAddress = "ygu@mircosoft.com";
     }
   }
 

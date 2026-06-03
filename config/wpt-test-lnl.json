@@ -1,0 +1,68 @@
+[
+    {
+        "name": "TFLite XNNPACK CPU",
+        "suite": "wpt",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --disable-features=WebNNOnnxRuntime"
+    },
+    {
+        "name": "TFLite MLDrift GPU",
+        "suite": "wpt",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --disable-features=WebNNOnnxRuntime"
+    },
+    {
+        "name": "ORT Default CPU",
+        "suite": "wpt",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-ignore-ihv-eps"
+    },
+    {
+        "name": "ORT Default GPU",
+        "suite": "wpt",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-ignore-ihv-eps"
+    },
+    {
+        "name": "ORT OV CPU",
+        "suite": "wpt",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork"
+    },
+    {
+        "name": "ORT OV GPU",
+        "suite": "wpt",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork"
+    },
+    {
+        "name": "ORT OV NPU",
+        "suite": "wpt",
+        "device": "npu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork"
+    },
+    {
+        "name": "ORT CI Default CPU",
+        "suite": "wpt",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-library-path-for-testing=C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705 --webnn-ort-ep-device=CPUExecutionProvider,0x8086,0x7 --allow-third-party-modules"
+    },
+    {
+        "name": "ORT CI OV CPU",
+        "suite": "wpt",
+        "device": "cpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-library-path-for-testing=C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705 --webnn-ort-ep-library-path-for-testing=OpenVINOExecutionProvider?C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705\\onnxruntime_providers_openvino_plugin.dll --webnn-ort-ep-device=OpenVINOExecutionProvider,0x8086,0x7 --allow-third-party-modules"
+    },
+    {
+        "name": "ORT CI OV GPU",
+        "suite": "wpt",
+        "device": "gpu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-library-path-for-testing=C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705 --webnn-ort-ep-library-path-for-testing=OpenVINOExecutionProvider?C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705\\onnxruntime_providers_openvino_plugin.dll --webnn-ort-ep-device=OpenVINOExecutionProvider,0x8086,0x64a0 --allow-third-party-modules"
+    },
+    {
+        "name": "ORT CI OV NPU",
+        "suite": "wpt",
+        "device": "npu",
+        "browser-arg": "--enable-features=WebMachineLearningNeuralNetwork --webnn-ort-library-path-for-testing=C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705 --webnn-ort-ep-library-path-for-testing=OpenVINOExecutionProvider?C:\\workspace\\onnxruntime-ep-openvino-ci-develop-705\\onnxruntime_providers_openvino_plugin.dll --webnn-ort-ep-device=OpenVINOExecutionProvider,0x8086,0x643e --allow-third-party-modules"
+    }
+]
