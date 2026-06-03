@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/main.js",
     "test": "playwright test",
+    "format": "prettier --write \"src/**/*.js\"",
     "test:wpt": "playwright test --project=chromium-canary -- --suite=wpt",
     "test:sample": "playwright test --project=chromium-canary -- --suite=sample",
     "test:preview": "playwright test --project=chromium-canary -- --suite=preview",
@@ -13,9 +14,15 @@
     "report-static": "start results/index.html"
   },
   "devDependencies": {
-    "@playwright/test": "^1.40.0"
+    "@playwright/test": "^1.40.0",
+    "prettier": "^3.8.3"
   },
-  "keywords": ["webnn", "playwright", "automation", "testing"],
+  "keywords": [
+    "webnn",
+    "playwright",
+    "automation",
+    "testing"
+  ],
   "author": "",
   "license": "MIT"
 }
