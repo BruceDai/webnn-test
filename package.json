@@ -12,6 +12,9 @@
     "report": "start results/index.html",
     "report-static": "start results/index.html"
   },
+  "dependencies": {
+    "nodemailer": "^6.10.1"
+  },
   "devDependencies": {
     "@playwright/test": "^1.40.0"
   },

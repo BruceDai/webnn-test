@@ -3,6 +3,7 @@ const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const nodemailer = require('nodemailer');
 const { chromium } = require('@playwright/test');
 const { getRuntimeInfo, runtimeInfoRows } = require('./runtime-info');
 
@@ -46,85 +47,42 @@ function findBrowserRootPid(processName = 'msedge.exe') {
 }
 
 async function send_email(subject, content, sender = '', to = '') {
-    // Create PowerShell script to send email via Outlook
-    const powershellScript = `
-try {
-    $outlook = New-Object -ComObject Outlook.Application
-    $mail = $outlook.CreateItem(0)  # olMailItem = 0
-
-    $mail.Subject = "${subject}"
-    $mail.HTMLBody = @'
-${content}
-'@
-
-    # Set recipient
-    ${to ? `$mail.To = "${to}"` : ''}
-    ${sender ? `$mail.SentOnBehalfOfName = "${sender}"` : ''}
-
-    # Send the email automatically
-    $mail.Send()
-
-    Write-Host "Email sent successfully${to ? ' to ' + to : ''}"
-    exit 0
-} catch {
-    Write-Host "Error sending email: $($_.Exception.Message)"
-    exit 1
-}`;
-
-    const tempDir = os.tmpdir();
-    const scriptPath = path.join(tempDir, `send-email-${Date.now()}.ps1`);
+    const emailService = {
+        serverConfig: {
+            host: '',
+            port: port
+        },
+        from: '',
+        to: ['']
+    };
 
     try {
-      // Write with BOM to ensure PowerShell reads it correctly as UTF-8
-      fs.writeFileSync(scriptPath, '\ufeff' + powershellScript, 'utf8');
-
-      return new Promise((resolve, reject) => {
-        const powershell = require('child_process').spawn('powershell.exe', [
-          '-ExecutionPolicy', 'Bypass',
-          '-File', scriptPath
-        ], {
-          stdio: ['pipe', 'pipe', 'pipe']
+        const transporter = nodemailer.createTransport({
+            host: emailService.serverConfig.host,
+            port: emailService.serverConfig.port,
+            secure: false,
+            tls: { rejectUnauthorized: false }
         });
 
-        let stdout = '';
-        let stderr = '';
+        const recipients = to
+        ? to.split(',').map(item => item.trim()).filter(Boolean)
+        : emailService.to;
 
-        powershell.stdout.on('data', (data) => {
-          stdout += data.toString();
+        const fromAddress = sender || emailService.from;
+
+        await transporter.sendMail({
+            from: fromAddress,
+            to: recipients.join(', '),
+            subject,
+            html: content
         });
 
-        powershell.stderr.on('data', (data) => {
-          stderr += data.toString();
-        });
-
-        powershell.on('close', (code) => {
-          // Clean up temp file
-          try {
-            if (fs.existsSync(scriptPath)) {
-              fs.unlinkSync(scriptPath);
-            }
-          } catch (e) {
-            console.log('Note: Could not clean up temporary file:', e.message);
-          }
-
-          if (code === 0) {
-            resolve(stdout.trim());
-          } else {
-            console.error('Failed to send email:', stderr.trim());
-            reject(new Error(`PowerShell exited with code ${code}: ${stderr}`));
-          }
-        });
-
-        powershell.on('error', (error) => {
-          reject(error);
-        });
-      });
-
+        return `Email sent successfully to ${recipients.join(', ')}`;
     } catch (error) {
-      console.error('Error in send_email:', error);
-      throw error;
+        console.error('Error in send_email:', error);
+        throw error;
     }
-  }
+}
 
   function _format_driver_date(dateString) {
     if (!dateString) return '';
@@ -1792,7 +1750,7 @@ class WebNNRunner {
 
   async sendEmailReport(emailAddress, testSuites, results, wallTime, sumOfTestTimes, reportTimestamp = null, htmlReportContent = null) {
     try {
-      console.log(`\n[Info] Sending email report to ${emailAddress}...`);
+    console.log(`\n[Info] Sending email report${emailAddress ? ` to ${emailAddress}` : ' to default recipients'}...`);
 
       // Calculate summary statistics
       const totalSubcases = results.reduce((sum, r) => sum + r.subcases.total, 0);
@@ -1821,14 +1779,14 @@ class WebNNRunner {
       })();
 
       // Create email subject: [WebNN Test Report] timestamp | machine name
-      const subject = `[${machineName}]WebNN Test Report - ${timestamp}`;
+      const subject = `[${machineName}] WebNN Test Report - ${timestamp}`;
 
       // Use provided HTML content or generate new one
       const htmlBody = htmlReportContent || this.generateHtmlReport(testSuites, null, results, null, wallTime, sumOfTestTimes);
 
-      await send_email(subject, htmlBody, '', emailAddress);
+      const sendResult = await send_email(subject, htmlBody, '', emailAddress);
 
-      console.log(`[Success] Email sent successfully to ${emailAddress}`);
+      console.log(`[Success] ${sendResult}`);
     } catch (error) {
       console.error(`[Fail] Failed to send email: ${error.message}`);
       console.error(`   This is a non-critical error - test results are still available in the HTML report`);
