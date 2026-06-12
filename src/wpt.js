@@ -11,27 +11,39 @@ class WptRunner extends WebNNRunner {
             return `"${text.replace(/"/g, '""')}"`;
         };
 
-        const getMessage = (result) => {
-            if (result.error) return result.error;
-            if (Array.isArray(result.failedSubtests) && result.failedSubtests.length > 0) {
-                return result.failedSubtests
-                    .map(s => `${s.name || 'subtest'}: ${s.message || s.status || 'FAIL'}`)
-                    .join(' | ');
-            }
-            return '';
-        };
+        const testCaseName = (r) => r.testName || r.fileName || '';
 
         const lines = [];
         lines.push(['Backend', 'Test Suite', 'Test Case', 'Status', 'Message'].map(csvEscape).join(','));
 
         for (const r of results) {
-            lines.push([
-                r.backend,
-                'WPT',
-                r.testName || r.fileName || '',
-                r.result || 'UNKNOWN',
-                getMessage(r)
-            ].map(csvEscape).join(','));
+            const backend = r.backend;
+            const caseName = testCaseName(r);
+            const hasFailedSubtests = Array.isArray(r.failedSubtests) && r.failedSubtests.length > 0;
+
+            if (hasFailedSubtests) {
+                // Emit one row per failed subtest so each failure is on its own line.
+                for (const s of r.failedSubtests) {
+                    const subName = s.name || 'subtest';
+                    const status = (s.status || r.result || 'FAIL').toString().toUpperCase();
+                    const message = s.message || '';
+                    lines.push([
+                        backend,
+                        'WPT',
+                        `${caseName} - ${subName}`,
+                        status,
+                        message
+                    ].map(csvEscape).join(','));
+                }
+            } else {
+                lines.push([
+                    backend,
+                    'WPT',
+                    caseName,
+                    r.result || 'UNKNOWN',
+                    r.error || ''
+                ].map(csvEscape).join(','));
+            }
         }
 
         const runDir = process.env.PROJECT_RUN_DIR || path.join(__dirname, '..', 'results');

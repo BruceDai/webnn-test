@@ -524,6 +524,7 @@ Examples:
 
                    // Store DLL info for this configuration
                    allDllResults.push({
+                      configName: config.name,
                       backend: config.name,
                       framework: fw,
                       device: config.device,
@@ -531,6 +532,7 @@ Examples:
                    });
 
                    runRes.forEach(r => {
+                       r.configName = config.name;
                        r.backend = config.name;
                        r.device = config.device;
                        r.fullConfig = config;
