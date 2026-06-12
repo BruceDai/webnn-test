@@ -24,11 +24,9 @@ class WptRunner extends WebNNRunner {
         const lines = [];
         lines.push(['Backend', 'Test Suite', 'Test Case', 'Status', 'Message'].map(csvEscape).join(','));
 
-        const backend = (process.env.CURRENT_CONFIG_NAME || '').trim() || 'UNKNOWN';
-
         for (const r of results) {
             lines.push([
-                backend,
+                r.backend,
                 'WPT',
                 r.testName || r.fileName || '',
                 r.result || 'UNKNOWN',
@@ -449,7 +447,6 @@ class WptRunner extends WebNNRunner {
         }
     }
 
-        this.writeFinalResultsCsv(results);
         return results;
   }
 

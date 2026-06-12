@@ -401,6 +401,7 @@ Examples:
               const configs = JSON.parse(process.env.TEST_CONFIG_LIST || '[]');
               let results = [];
               let runner = null;
+              let wptRunner = null;
               const startTime = Date.now();
               // Store DLL results per configuration
               // Structure: { configName: string, framework: string, backend: string, device: string, results: object }
@@ -477,6 +478,7 @@ Examples:
                    if (config.suite === 'wpt') {
                        currentRunner = new WptRunner(page);
                        currentRunner.launchNewBrowser = launchInstance;
+                       wptRunner = currentRunner;
                    } else {
                        currentRunner = new ModelRunner(page);
                        currentRunner.launchNewBrowser = launchInstance;
@@ -519,29 +521,37 @@ Examples:
                    }
 
                    const fw = getFramework(config.browserArgs);
-                   const bk = getBackend(fw, config.browserArgs, currentDllResults, config.device);
 
                    // Store DLL info for this configuration
                    allDllResults.push({
-                      configName: config.name,
+                      backend: config.name,
                       framework: fw,
-                      backend: bk,
                       device: config.device,
                       dllInfo: currentDllResults
                    });
 
                    runRes.forEach(r => {
-                       r.configName = config.name;
+                       r.backend = config.name;
                        r.device = config.device;
                        r.fullConfig = config;
                        r.configIndex = idx;
                        // Determine identifiers for report matching
                        r.framework = fw;
-                       // We use the dllResults (global for now, but usually reflects the first/main run)
-                       // If multiple configs are run, this might need refinement to be per-config
-                       r.backend = bk;
                    });
+
                    results = results.concat(runRes);
+              }
+
+              // Write a single WPT CSV containing results from all backends after the loop
+              if (wptRunner && typeof wptRunner.writeFinalResultsCsv === 'function') {
+                   const wptResults = results.filter(r => (r.fullConfig && r.fullConfig.suite === 'wpt'));
+                   if (wptResults.length > 0) {
+                       try {
+                           wptRunner.writeFinalResultsCsv(wptResults);
+                       } catch (e) {
+                           console.log(`[Warning] Failed to write WPT CSV: ${e.message}`);
+                       }
+                   }
               }
 
               if (results.length > 0 && runner) {
