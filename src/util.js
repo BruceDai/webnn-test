@@ -790,6 +790,41 @@ class WebNNRunner {
         .replace(/[^A-Za-z0-9]+/g, '-')
         .replace(/^-+|-+$/g, '');
 
+    // Renders the "Failure Details" cell shown in the regression table for a
+    // baseline-comparison entry. Uses the current run's captured error text,
+    // fullText (when hasErrors), and failedSubtests array.
+    const buildRegressionDetailHtml = (entry) => {
+        const cur = entry.current || {};
+        const parts = [];
+        const errText = cur.error || (cur.hasErrors ? cur.fullText : '');
+        if (errText) {
+            const snippet = String(errText).slice(0, 600);
+            parts.push(
+                `<div style="font-family:monospace;font-size:11px;color:#5f2120;white-space:pre-wrap;word-break:break-word;background:#fff;border-left:3px solid #dc3545;padding:4px 6px;border-radius:3px;">${snippet}</div>`
+            );
+        }
+        const subs = Array.isArray(cur.failedSubtests) ? cur.failedSubtests : [];
+        if (subs.length > 0) {
+            const shown = subs.slice(0, 5);
+            const more = subs.length - shown.length;
+            parts.push(
+                `<details style="margin-top:4px;">` +
+                `<summary style="cursor:pointer;color:#dc3545;font-size:12px;font-weight:bold;">${subs.length} failed subtest(s)</summary>` +
+                shown.map((s, i) =>
+                    `<div style="margin:4px 0;padding:4px 6px;background:#fff;border-left:3px solid #dc3545;border-radius:2px;">` +
+                    `<div style="font-size:11px;font-weight:bold;word-break:break-word;">${i + 1}. ${s.name || ''}${s.status && s.status !== 'FAIL' ? ` <span style="color:#fd7e14;">(${s.status})</span>` : ''}</div>` +
+                    (s.message
+                        ? `<div style="font-family:monospace;font-size:11px;color:#586069;white-space:pre-wrap;word-break:break-word;background:#f6f8fa;padding:3px;border-radius:2px;margin-top:2px;">${String(s.message).slice(0, 400)}</div>`
+                        : '') +
+                    `</div>`
+                ).join('') +
+                (more > 0 ? `<div style="font-size:11px;color:#586069;margin-top:4px;">\u2026 and ${more} more</div>` : '') +
+                `</details>`
+            );
+        }
+        return parts.join('') || '<span style="color:#ccc;">-</span>';
+    };
+
     // Calculate overall regressions and improvements (case-level and subcase-level)
     const allRegressions = [];
     const allImprovements = [];
@@ -802,10 +837,10 @@ class WebNNRunner {
             const groupKey = backendName;
             if (wasPass && !isPass) {
                 // Case-level regression
-                allRegressions.push({ name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'case' });
+                allRegressions.push({ name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'case', current: r });
             } else if (!wasPass && isPass) {
                 // Case-level improvement
-                allImprovements.push({ name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'case' });
+                allImprovements.push({ name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'case', current: r });
             } else if (r.previousSubcases && r.subcases && r.subcases.total > 0) {
                 // Same case-level result — check subcase-level changes
                 const prevSc = r.previousSubcases;
@@ -815,12 +850,14 @@ class WebNNRunner {
                     if (curSc.passed < prevSc.passed || (curSc.passed === prevSc.passed && curSc.total > prevSc.total)) {
                         allRegressions.push({
                             name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
-                            subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`
+                            subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`,
+                            current: r
                         });
                     } else if (curSc.passed > prevSc.passed || (curSc.passed === prevSc.passed && curSc.total < prevSc.total)) {
                         allImprovements.push({
                             name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
-                            subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`
+                            subcaseInfo: `${prevSc.passed}/${prevSc.total} \u2192 ${curSc.passed}/${curSc.total}`,
+                            current: r
                         });
                     }
                 } else if (prevSc.failed !== undefined) {
@@ -830,12 +867,14 @@ class WebNNRunner {
                     if (curFailed > prevFailed) {
                         allRegressions.push({
                             name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
-                            subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`
+                            subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`,
+                            current: r
                         });
                     } else if (curFailed < prevFailed) {
                         allImprovements.push({
                             name: r.testName, result: r.result, prev, group: groupKey, backendName, type: 'subcase',
-                            subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`
+                            subcaseInfo: `${prevFailed} failed \u2192 ${curFailed} failed`,
+                            current: r
                         });
                     }
                 }
@@ -1115,15 +1154,17 @@ class WebNNRunner {
                             <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Test Case</th>
                             <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Baseline</th>
                             <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Current</th>
+                            <th style="border: 1px solid #f5c6cb; padding: 6px 10px; text-align: left; background-color: #ffe0e0;">Failure Details</th>
                         </tr>
                     </thead>
                     <tbody>
                         ${allRegressions.map(t => `
                         <tr>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #586069;">${t.backendName || '-'}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
-                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #586069; vertical-align: top;">${t.backendName || '-'}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; vertical-align: top;"><strong>${t.name}</strong>${t.type === 'subcase' ? ' <span style="font-size:11px;color:#856404;">[subcase]</span>' : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #28a745; font-weight: bold; vertical-align: top;">${t.prev}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[0]})</span>` : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; color: #dc3545; font-weight: bold; vertical-align: top;">${t.result}${t.subcaseInfo ? ` <span style="font-size:12px;font-weight:normal;">(${t.subcaseInfo.split(' \u2192 ')[1]})</span>` : ''}</td>
+                            <td style="border: 1px solid #f5c6cb; padding: 6px 10px; vertical-align: top; max-width: 480px;">${buildRegressionDetailHtml(t)}</td>
                         </tr>`).join('')}
                     </tbody>
                 </table>
