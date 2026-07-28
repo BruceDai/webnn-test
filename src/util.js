@@ -638,8 +638,8 @@ class WebNNRunner {
                         findings = modules.filter(m => {
                             const name = (m.ModuleName || '').toLowerCase();
                             const path = (m.FileName || '').toLowerCase();
-                            return name.includes('onnxruntime') || name.includes('openvino') || name.includes('directml') || name.includes('tensorrt') || name.includes('migraphx') || name.includes('qnn') ||
-                                   path.includes('onnxruntime') || path.includes('openvino') || path.includes('directml') || path.includes('tensorrt') || path.includes('migraphx') || path.includes('qnn');
+                            return name.includes('onnxruntime') || name.includes('openvino') || name.includes('directml') || name.includes('tensorrt') || name.includes('migraphx') || name.includes('qnn') || name === 'dxil.dll' || name === 'dxcompiler.dll' ||
+                                   path.includes('onnxruntime') || path.includes('openvino') || path.includes('directml') || path.includes('tensorrt') || path.includes('migraphx') || path.includes('qnn') || path.endsWith('\\dxil.dll') || path.endsWith('\\dxcompiler.dll');
                         });
                     } catch(e) {}
                 }
@@ -650,7 +650,7 @@ class WebNNRunner {
             if (findings.length === 0) {
                  try {
                      // Check common DLL names
-                     const dllNames = ['onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'openvino.dll', 'DirectML.dll', 'nvinfer.dll', 'migraphx.dll', 'QnnHtp.dll'];
+                     const dllNames = ['onnxruntime.dll', 'onnxruntime_providers_shared.dll', 'openvino.dll', 'DirectML.dll', 'nvinfer.dll', 'migraphx.dll', 'QnnHtp.dll', 'dxil.dll', 'dxcompiler.dll'];
 
                      // tasklist /M <pattern> lists processes using it. We filter for our PID.
                      // It's faster to run: tasklist /FI "PID eq <PID>" /M
@@ -671,6 +671,8 @@ class WebNNRunner {
                          if (tasklistOut.includes('nvinfer') || tasklistOut.includes('tensorrt')) foundDlls.push('tensorrt.dll');
                          if (tasklistOut.includes('migraphx')) foundDlls.push('migraphx.dll');
                          if (tasklistOut.includes('qnn')) foundDlls.push('QnnHtp.dll');
+                         if (/\bdxil\.dll\b/.test(tasklistOut)) foundDlls.push('dxil.dll');
+                         if (/\bdxcompiler\.dll\b/.test(tasklistOut)) foundDlls.push('dxcompiler.dll');
 
                          // Create synthetic finding objects
                          findings = foundDlls.map(name => ({
