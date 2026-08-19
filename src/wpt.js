@@ -2,7 +2,7 @@
 const { test } = require('@playwright/test');
 const fs = require('fs');
 const path = require('path');
-const { WebNNRunner } = require('./util');
+const { WebNNRunner, killOwnBrowserProcesses, armHangKillWatchdog, withHangKill } = require('./util');
 
 class WptRunner extends WebNNRunner {
     writeFinalResultsCsv(results) {
@@ -69,6 +69,22 @@ class WptRunner extends WebNNRunner {
     const wptCase = process.env.WPT_CASE;
     const specifiedJobs = process.env.JOBS;
     const jobs = specifiedJobs ? parseInt(specifiedJobs, 10) : 1;
+    // Per-case timeouts (configurable via env). Some WPT conformance tests
+    // (e.g. reshape on NPU/OV) can take well over a minute to complete, and
+    // 60s was too aggressive for slower backends. Defaults were raised and
+    // the outer chunked-exec timeout is kept comfortably larger than the
+    // inner per-case timeout so the inner Promise.race always wins first.
+    const caseTimeoutMs = parseInt(process.env.WPT_CASE_TIMEOUT_MS, 10) || 180000; // 3 min per test case (inner)
+    const chunkTimeoutMs = parseInt(process.env.WPT_CHUNK_TIMEOUT_MS, 10) || (caseTimeoutMs + 60000); // outer wrapper
+    // Hang-kill watchdog: when a test step (including its cleanup) exceeds
+    // this budget, force-kill our Chrome processes to unblock any Playwright
+    // IPC calls that are stuck at the browser side. This is the last-resort
+    // safety net when the inner Promise.race timeout also can't recover
+    // because the follow-up page.close()/context.close() awaits are hung.
+    const hangKillTimeoutMs = parseInt(process.env.WPT_HANG_KILL_TIMEOUT_MS, 10) || (chunkTimeoutMs + 30000);
+    // Short per-op timeout used inside the finally block so a wedged
+    // page.close()/context.close()/browser.close() can't hang the run.
+    const closeOpTimeoutMs = parseInt(process.env.WPT_CLOSE_OP_TIMEOUT_MS, 10) || 15000;
     let testCases = [];
     let selectedIndices = new Set();
     const rangeFilter = process.env.WPT_RANGE;
@@ -169,6 +185,16 @@ class WptRunner extends WebNNRunner {
 
                 await test.step(`Test: ${testFile}`, async () => {
                      let page = null;
+                     // Arm hang-kill watchdog for this whole step (execution +
+                     // cleanup). If anything below hangs longer than
+                     // hangKillTimeoutMs — including the finally-block awaits —
+                     // we force-kill our Chrome processes so pending Playwright
+                     // IPC calls fail fast and the run makes forward progress.
+                     const hangWatchdog = armHangKillWatchdog(
+                         hangKillTimeoutMs,
+                         `WPT test step ${testFile}`,
+                         this.browserRootPid
+                     );
                      try {
                          // For isolation: kill/relaunch browser for every conformance test.
                          while (isRestarting) await new Promise(r => setTimeout(r, 100));
@@ -192,9 +218,9 @@ class WptRunner extends WebNNRunner {
                          const res = await Promise.race([
                              this.runSingleWptTest(page, testFile, i, files.length, 0),
                              new Promise((_, reject) => {
-                                 const timeoutError = new Error('Test timeout 120000ms exceeded');
+                                 const timeoutError = new Error(`Test timeout ${chunkTimeoutMs}ms exceeded`);
                                  timeoutError.name = 'ChunkedExecTimeoutError';
-                                 setTimeout(() => reject(timeoutError), 120000);
+                                 setTimeout(() => reject(timeoutError), chunkTimeoutMs);
                              })
                          ]);
                          res.executionTime = ((Date.now() - start) / 1000).toFixed(2);
@@ -223,28 +249,63 @@ class WptRunner extends WebNNRunner {
                              await onFirstCaseComplete();
                          }
                      } catch (e) {
+                         // Classify timeouts before critical/crash errors so a slow/hung
+                         // test is reported as TIMEOUT rather than CRASH. Any error whose
+                         // name is a timeout name, or whose message contains "Timeout" /
+                         // "ms exceeded" (both our inner Promise.race and the outer
+                         // chunked-exec wrapper produce such messages), is a timeout.
                          const isTimeoutError = e.name === 'ChunkedExecTimeoutError' ||
-                                              (e.message && e.message.includes('120000ms'));
-                         const isCriticalError = e.message === 'GPUContextCreationError' ||
+                                              e.name === 'TimeoutError' ||
+                                              (e.message && (/ms exceeded/i.test(e.message) || /timeout/i.test(e.message)));
+                         const isCriticalError = !isTimeoutError && (
+                                               e.message === 'GPUContextCreationError' ||
                                                e.message === 'HarnessError' ||
                                                e.message.includes('Protocol error') ||
                                                e.message.includes('Target.createTarget') ||
                                                e.message.includes('Target.close') ||
                                                e.message.includes('browserContext.newPage') ||
-                                               e.message.includes('Target closed') ||
-                                               e.message.includes('Timeout') ||
-                                               e.name === 'TimeoutError';
+                                               e.message.includes('Target closed'));
 
                          if (isTimeoutError) {
                              console.log(`[Fail] Timeout for ${testFile} (${e.message}). Marking as TIMEOUT and restarting browser...`);
+
+                             // Best-effort: scrape whatever the WPT harness produced
+                             // before our per-case cap fired. This preserves the
+                             // subtests that already completed (pass/fail/timeout)
+                             // so the report reflects real progress instead of a
+                             // synthetic {total:1, passed:0, failed:1}. The overall
+                             // case status stays TIMEOUT.
+                             let partialSubcases = { total: 1, passed: 0, failed: 1 };
+                             let partialFailedSubtests;
+                             let partialSummary = '';
+                             try {
+                                 if (page && !page.isClosed()) {
+                                     const partial = await Promise.race([
+                                         this.parseWptPageResults(page, true),
+                                         new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+                                     ]);
+                                     if (partial && partial.subcases && partial.subcases.total > 0) {
+                                         partialSubcases = partial.subcases;
+                                         if (partial.failedSubtests && partial.failedSubtests.length > 0) {
+                                             partialFailedSubtests = partial.failedSubtests;
+                                         }
+                                         partialSummary = ` Partial: ${partial.subcases.passed}P/${partial.subcases.failed}F/${partial.subcases.total}T.`;
+                                     }
+                                 }
+                             } catch (_) { /* best-effort */ }
+
+                             if (partialSummary) {
+                                 console.log(`[Info] Preserved partial WPT results for ${testFile}:${partialSummary}`);
+                             }
 
                              results.push({
                                  testName: testFile,
                                  fileName: testFile,
                                  suite: 'WPT',
                                  result: 'TIMEOUT',
-                                 subcases: { total: 1, passed: 0, failed: 1 },
-                                 error: e.message
+                                 subcases: partialSubcases,
+                                 failedSubtests: partialFailedSubtests,
+                                 error: `${e.message}.${partialSummary}`
                              });
 
                              if (!isRestarting) {
@@ -309,9 +370,49 @@ class WptRunner extends WebNNRunner {
                              });
                          }
                      } finally {
+                         // Guard each close with a short timeout so a wedged
+                         // Playwright IPC can't hang the run. The final
+                         // killOwnBrowserProcesses call is synchronous
+                         // (taskkill) and will unblock anything still pending.
+                         const guardedClose = async (closable, label) => {
+                             if (!closable) return;
+                             try {
+                                 await Promise.race([
+                                     closable.close(),
+                                     new Promise((_, reject) => setTimeout(
+                                         () => reject(new Error(`${label}.close() timeout ${closeOpTimeoutMs}ms`)),
+                                         closeOpTimeoutMs
+                                     ))
+                                 ]);
+                             } catch (err) {
+                                 console.log(`[Warning] ${label}.close() failed/timed out: ${err.message}`);
+                             }
+                         };
                          if (page && !page.isClosed()) {
-                             try { await page.close(); } catch(e) {}
+                             await guardedClose(page, 'page');
                          }
+                         // Explicitly close the current browser/context and sweep any
+                         // leftover chrome/msedge processes matching our user-data-dir.
+                         // Playwright's close() alone leaves renderer/GPU/utility
+                         // processes behind; without this sweep dozens of stale processes
+                         // accumulate over a full WPT run.
+                         try {
+                             if (currentContext) await guardedClose(currentContext, 'context');
+                             if (currentBrowser && currentBrowser !== currentContext) {
+                                 await guardedClose(currentBrowser, 'browser');
+                             }
+                             currentContext = null;
+                             currentBrowser = null;
+                             this.page = null;
+                         } catch (_) {}
+                         try { killOwnBrowserProcesses(null); } catch(e) {}
+                         // Disarm the per-step hang-kill watchdog. If it
+                         // already fired we log; the sweep above has already
+                         // killed the browser so the next test will relaunch.
+                         if (hangWatchdog.fired()) {
+                             console.error(`[HangKill] Test step ${testFile} was force-killed after ${hangKillTimeoutMs}ms hang.`);
+                         }
+                         hangWatchdog.disarm();
                      }
                 });
             }
@@ -354,6 +455,13 @@ class WptRunner extends WebNNRunner {
                 const testFile = result.fileName;
                 const maxRetries = 3;
                 let attempt = 1;
+                // Track whether any retry attempt has completed the test harness
+                // (returned a real result, not thrown a critical exception). Once we
+                // have such a result, subsequent critical exceptions must NOT overwrite
+                // it with CRASH — the "last completed retry" outcome wins over
+                // exception-path crashes so a first-pass CRASH is correctly replaced
+                // by FAIL/PASS observed in retries.
+                let hasCompletedRetry = false;
                 // Initialize history with the failure from the first pass
                 let retryHistory = [{
                     attempt: 0,
@@ -367,6 +475,15 @@ class WptRunner extends WebNNRunner {
 
                 while (attempt <= maxRetries) {
                     let retryInstance = null;
+                    // Same hang-kill safety net for the retry pass. Without
+                    // this, a retry that wedges on Playwright IPC would keep
+                    // the run stuck indefinitely (Promise.race can't recover
+                    // if the finally-block close() awaits also hang).
+                    const retryHangWatchdog = armHangKillWatchdog(
+                        hangKillTimeoutMs,
+                        `WPT retry ${attempt} for ${testFile}`,
+                        this.browserRootPid
+                    );
                     try {
                         // "for each retry, we should launch a new browser context"
                         retryInstance = await this.launchNewBrowser();
@@ -400,57 +517,196 @@ class WptRunner extends WebNNRunner {
                             total: res.subcases.total
                         });
 
-                        // Update result if passed or stabilized
+                        // Mark that this retry completed the harness. We use this to
+                        // prevent later exception-path handlers from downgrading the
+                        // final status back to CRASH.
+                        hasCompletedRetry = true;
+
+                        // Always replace the first-pass status with the latest retry
+                        // outcome — the retry results are authoritative over the
+                        // initial CRASH/FAIL. A PASS additionally stops retries.
                         if (res.result === 'PASS') {
                              console.log(`[Success] Retry ${attempt} PASSED!`);
                              result.result = 'PASS';
                              result.subcases = res.subcases;
+                             result.error = undefined;
+                             result.crashed = false;
+                             // Strip any leading [CRASH] label added on the first pass so
+                             // the reported case name reflects the retry outcome.
+                             if (typeof result.testName === 'string') {
+                                 result.testName = result.testName.replace(/^\s*\[CRASH\]\s*/, '');
+                             }
                              result.retryHistory = retryHistory;
                              break; // Stop retrying this case
-                        } else {
-                             // Check if result is same as previous (using helper from base class)
-                             if (this.compareTestResults(result, res)) {
-                                 console.log(`[Warning]  Retry ${attempt} result matches previous failure. Stopping retries for this case.`);
-                                 result.retryHistory = retryHistory;
-                                 break;
-                             }
-                             // Update result to latest failure
-                             result.result = res.result;
-                             result.subcases = res.subcases;
-                             result.error = res.error;
-                             result.crashed = !!res.crashed;
+                        }
+
+                        // Non-PASS: update result to reflect the latest retry outcome,
+                        // replacing the initial CRASH/FAIL. This ensures a FAIL from a
+                        // retry replaces a CRASH from the first pass.
+                        result.result = res.result;
+                        // If the retry produced an UNKNOWN with no parseable subcase
+                        // counts (e.g. the page was a 504/timeout/error page), keep
+                        // the initial run's subcase totals so the summary doesn't
+                        // report "0/0/0" (or worse, a stale garbage number) for a
+                        // test that actually has a known subcase count.
+                        const retryUnparseable =
+                            res.result === 'UNKNOWN' &&
+                            (!res.subcases || (res.subcases.total === 0 && res.subcases.passed === 0 && res.subcases.failed === 0));
+                        if (!retryUnparseable) {
+                            result.subcases = res.subcases;
+                        }
+                        result.error = res.error;
+                        result.crashed = !!res.crashed;
+                        if (typeof result.testName === 'string') {
+                            const hadCrashLabel = /^\s*\[CRASH\]\s*/.test(result.testName);
+                            if (hadCrashLabel && res.result !== 'CRASH') {
+                                // No longer a crash — drop the stale [CRASH] label.
+                                result.testName = result.testName.replace(/^\s*\[CRASH\]\s*/, '');
+                            }
+                        }
+
+                        // Stop retrying if this retry stabilized on the same failure.
+                        if (this.compareTestResults(result, res)) {
+                            console.log(`[Warning]  Retry ${attempt} result matches previous failure. Stopping retries for this case.`);
+                            result.retryHistory = retryHistory;
+                            break;
                         }
 
                     } catch (e) {
-                        const isCriticalError = e.message === 'GPUContextCreationError' ||
+                        // Detect timeouts separately from other critical errors: a
+                        // timeout is a slow/hung test, not a browser/GPU crash, so it
+                        // must not be labeled [CRASH].
+                        const isTimeoutError = e.name === 'ChunkedExecTimeoutError' ||
+                                               e.name === 'TimeoutError' ||
+                                               (e.message && (/ms exceeded/i.test(e.message) || /timeout/i.test(e.message)));
+                        const isCriticalError = !isTimeoutError && (
+                                              e.message === 'GPUContextCreationError' ||
                                               e.message === 'HarnessError' ||
                                               e.message.includes('Protocol error') ||
                                               e.message.includes('Target.createTarget') ||
                                               e.message.includes('Target.close') ||
                                               e.message.includes('browserContext.newPage') ||
-                                              e.message.includes('Target closed') ||
-                                              e.message.includes('Timeout') ||
-                                              e.name === 'TimeoutError';
+                                              e.message.includes('Target closed'));
 
-                        if (isCriticalError) {
+                        if (isTimeoutError) {
+                            console.error(`[Fail] Timeout during retry ${attempt}: ${e.message}`);
+
+                            // Best-effort: scrape any partial WPT results the
+                            // retry page produced before our per-case cap fired.
+                            let partialSubcases = null;
+                            let partialFailedSubtests;
+                            let partialSummary = '';
+                            try {
+                                const retryPage = retryInstance && retryInstance.page;
+                                if (retryPage && !retryPage.isClosed()) {
+                                    const partial = await Promise.race([
+                                        this.parseWptPageResults(retryPage, true),
+                                        new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+                                    ]);
+                                    if (partial && partial.subcases && partial.subcases.total > 0) {
+                                        partialSubcases = partial.subcases;
+                                        if (partial.failedSubtests && partial.failedSubtests.length > 0) {
+                                            partialFailedSubtests = partial.failedSubtests;
+                                        }
+                                        partialSummary = ` Partial: ${partial.subcases.passed}P/${partial.subcases.failed}F/${partial.subcases.total}T.`;
+                                    }
+                                }
+                            } catch (_) { /* best-effort */ }
+
+                            if (partialSummary) {
+                                console.log(`[Info] Preserved partial WPT results for retry ${attempt}:${partialSummary}`);
+                            }
+
+                            // Only overwrite the final status if we have not yet
+                            // observed a completed retry. Timeouts are recorded as
+                            // TIMEOUT (never CRASH) and never get a [CRASH] prefix.
+                            if (!hasCompletedRetry) {
+                                result.result = 'TIMEOUT';
+                                result.error = `${e.message}.${partialSummary}`;
+                                result.crashed = false;
+                                if (partialSubcases) {
+                                    result.subcases = partialSubcases;
+                                }
+                                if (partialFailedSubtests) {
+                                    result.failedSubtests = partialFailedSubtests;
+                                }
+                                if (typeof result.testName === 'string') {
+                                    result.testName = result.testName.replace(/^\s*\[CRASH\]\s*/, '');
+                                }
+                            }
+                            retryHistory.push({
+                                attempt,
+                                status: 'TIMEOUT',
+                                passed: partialSubcases ? partialSubcases.passed : 0,
+                                failed: partialSubcases ? partialSubcases.failed : 1,
+                                total: partialSubcases ? partialSubcases.total : 1,
+                                error: `${e.message}${partialSummary}`
+                            });
+                        } else if (isCriticalError) {
                             const crashLabel = '[CRASH]';
                             console.error(`[Fail] ${crashLabel} Error during retry ${attempt}: ${e.message}`);
-                            result.result = 'CRASH';
-                            result.error = `${crashLabel} ${e.message}`;
-                            result.crashed = true;
-                            retryHistory.push({ attempt, status: 'CRASH', error: e.message });
+                            // Only downgrade the final status to CRASH if we have not
+                            // yet observed a completed retry. Otherwise, preserve the
+                            // "last completed retry" outcome (PASS/FAIL) — a subsequent
+                            // browser/protocol crash should not wipe out a real result.
+                            if (!hasCompletedRetry) {
+                                result.result = 'CRASH';
+                                result.error = `${crashLabel} ${e.message}`;
+                                result.crashed = true;
+                            }
+                            retryHistory.push({
+                                attempt,
+                                status: 'CRASH',
+                                passed: 0,
+                                failed: 1,
+                                total: 1,
+                                error: e.message
+                            });
                         } else {
                             console.error(`[Fail] Error during retry ${attempt}: ${e.message}`);
-                            retryHistory.push({ attempt, status: 'ERROR', error: e.message });
+                            retryHistory.push({
+                                attempt,
+                                status: 'ERROR',
+                                passed: 0,
+                                failed: 1,
+                                total: 1,
+                                error: e.message
+                            });
                         }
                     } finally {
                         if (retryInstance) {
+                            const guardedRetryClose = async (closable, label) => {
+                                if (!closable) return;
+                                try {
+                                    await Promise.race([
+                                        closable.close(),
+                                        new Promise((_, reject) => setTimeout(
+                                            () => reject(new Error(`retry ${label}.close() timeout ${closeOpTimeoutMs}ms`)),
+                                            closeOpTimeoutMs
+                                        ))
+                                    ]);
+                                } catch (err) {
+                                    console.log(`[Warning] retry ${label}.close() failed/timed out: ${err.message}`);
+                                }
+                            };
                             try {
-                               if (retryInstance.page && !retryInstance.page.isClosed()) await retryInstance.page.close();
-                               if (retryInstance.context) await retryInstance.context.close();
-                               if (retryInstance.browser && retryInstance.browser !== retryInstance.context) await retryInstance.browser.close();
+                                if (retryInstance.page && !retryInstance.page.isClosed()) {
+                                    await guardedRetryClose(retryInstance.page, 'page');
+                                }
+                                if (retryInstance.context) await guardedRetryClose(retryInstance.context, 'context');
+                                if (retryInstance.browser && retryInstance.browser !== retryInstance.context) {
+                                    await guardedRetryClose(retryInstance.browser, 'browser');
+                                }
                             } catch(e) {}
                         }
+                        // Playwright's soft close() often leaves orphan renderer/GPU/utility
+                        // processes behind. Sweep any chrome/msedge processes still using our
+                        // user-data-dir so we don't accumulate dozens of processes over a run.
+                        try { killOwnBrowserProcesses(null); } catch(e) {}
+                        if (retryHangWatchdog.fired()) {
+                            console.error(`[HangKill] Retry ${attempt} for ${testFile} was force-killed after ${hangKillTimeoutMs}ms hang.`);
+                        }
+                        retryHangWatchdog.disarm();
                     }
                     attempt++;
                 }
@@ -458,6 +714,10 @@ class WptRunner extends WebNNRunner {
             }
         }
     }
+
+        // Final cleanup: make sure no chrome/msedge processes from this run
+        // are left behind when runWptTests returns.
+        try { killOwnBrowserProcesses(null); } catch(e) {}
 
         return results;
   }
@@ -525,68 +785,20 @@ class WptRunner extends WebNNRunner {
 
   // Removed runTestWithRetry as it's replaced by the retry logic above
 
-  async runSingleWptTest(page, testFile, index, totalFiles, retryCount = 0) {
-    const testFileName = testFile.replace('.js', '.html');
-    const device = process.env.DEVICE || 'cpu';
-    const testUrl = `https://wpt.live/webnn/conformance_tests/${testFileName}?device=${device}`;
-    const testName = testFile.replace('.https.any.js', '').replace('.js', '');
-
-    let logPrefix = `Running test`;
-    if (index >= 0 && totalFiles > 0) {
-        logPrefix += ` ${index+1}/${totalFiles}`;
-    }
-    if (retryCount > 0) {
-        logPrefix += ` [Retry ${retryCount}]`;
-    }
-    console.log(`${logPrefix}: ${testName}`);
-
-    const runTest = async () => {
-        await page.goto(testUrl, { waitUntil: 'networkidle', timeout: 60000 });
-
-        // check if encounter gpu context error or harness error
-        const crashError = await page.evaluate(() => {
-            const pre = document.evaluate('//*[@id="summary"]/section/pre[1]', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (pre && pre.textContent.includes('Error: Unable to create context for gpu variant')) {
-                return 'GPUContextCreationError';
-            }
-
-            const summarySpan = document.evaluate('//*[@id="summary"]/section/p/span', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (summarySpan && (summarySpan.textContent.includes('Error'))) {
-                 return 'HarnessError';
-            }
-            return null;
-       });
-
-       if (crashError) {
-            throw new Error(crashError);
-       }
-
-        await page.waitForTimeout(3000);
-
-        // Wait for results indicator
-        try {
-             // Check if .status selector exists first
-            const hasStatusSelector = await page.evaluate(() => document.querySelector('.status') !== null);
-            if (hasStatusSelector) {
-                await page.waitForSelector('.status', { timeout: 60000 });
-            } else {
-                await page.waitForFunction(() =>
-                    document.body.textContent.includes('Pass') ||
-                    document.body.textContent.includes('Fail') ||
-                    document.body.textContent.includes('Found') ||
-                    document.body.textContent.includes('test'),
-                    { timeout: 60000 }
-                );
-            }
-        } catch(e) { /* proceed */ }
-
-        await page.waitForTimeout(2000);
-
-        // Parse results with robust logic from original file
-        // Also scrape detailed failure info if verbose mode is enabled
-        const verboseEnabled = true;
-
-        const resData = await page.evaluate((scrapeDetails) => {
+  /**
+   * Scrape WPT harness results from the current page. Extracted from
+   * runSingleWptTest so it can also be called from the chunkedExec timeout
+   * handler to preserve partial subcase results when our per-case cap fires
+   * mid-run. Best-effort: returns { result, subcases, failedSubtests } and
+   * never throws (returns null on failure).
+   *
+   * @param {import('@playwright/test').Page} page
+   * @param {boolean} scrapeDetails - When true, populate failedSubtests[].
+   */
+  async parseWptPageResults(page, scrapeDetails = true) {
+    if (!page || page.isClosed()) return null;
+    try {
+        return await page.evaluate((scrapeDetails) => {
             const body = document.body.textContent;
             let subcases = { total: 0, passed: 0, failed: 0 };
 
@@ -628,14 +840,13 @@ class WptRunner extends WebNNRunner {
                 }
             }
 
-            // If still 0, try fallback guess
-            if (subcases.total === 0) {
-                const allNumbers = body.match(/\d+/g) || [];
-                if (body.toLowerCase().includes('test') && allNumbers.length >= 2) {
-                     subcases.total = Math.max(...allNumbers.map(n => parseInt(n)));
-                     if (body.toLowerCase().includes('pass')) subcases.passed = subcases.total;
-                }
-            }
+            // NOTE: Do NOT attempt to "guess" the subcase total by grabbing arbitrary
+            // numbers from the page body. Error pages (e.g. "504 Gateway Timeout",
+            // stack traces, timestamps) contain numbers that have no relation to the
+            // subcase count and produced misleading totals like "504" for tests that
+            // actually have 25 subcases. If no explicit "N Pass / N Fail / N tests"
+            // pattern was matched above, leave subcases at 0 and let resultStatus
+            // fall through to UNKNOWN so the report reflects reality.
 
             // Fallback for completion
             if (subcases.total === 0) {
@@ -703,7 +914,82 @@ class WptRunner extends WebNNRunner {
             }
 
             return { result: resultStatus, subcases, failedSubtests };
-        }, verboseEnabled);
+        }, scrapeDetails);
+    } catch (e) {
+        return null;
+    }
+  }
+
+  async runSingleWptTest(page, testFile, index, totalFiles, retryCount = 0) {
+    const testFileName = testFile.replace('.js', '.html');
+    const device = process.env.DEVICE || 'cpu';
+    const testUrl = `https://wpt.live/webnn/conformance_tests/${testFileName}?device=${device}`;
+    const testName = testFile.replace('.https.any.js', '').replace('.js', '');
+
+    // Per-case timeout (configurable). Previously hard-coded to 60000ms which
+    // was too short for slower backends (e.g. NPU/OV reshape/abs). Bumped to
+    // 180s by default and made env-configurable.
+    const caseTimeoutMs = parseInt(process.env.WPT_CASE_TIMEOUT_MS, 10) || 180000;
+    // Navigation / selector waits scale with case timeout but capped separately
+    // so a single slow page load can't burn the whole per-case budget.
+    const navTimeoutMs = parseInt(process.env.WPT_NAV_TIMEOUT_MS, 10) || Math.min(caseTimeoutMs, 90000);
+
+    let logPrefix = `Running test`;
+    if (index >= 0 && totalFiles > 0) {
+        logPrefix += ` ${index+1}/${totalFiles}`;
+    }
+    if (retryCount > 0) {
+        logPrefix += ` [Retry ${retryCount}]`;
+    }
+    console.log(`${logPrefix}: ${testName}`);
+
+    const runTest = async () => {
+        await page.goto(testUrl, { waitUntil: 'networkidle', timeout: navTimeoutMs });
+
+        // check if encounter gpu context error or harness error
+        const crashError = await page.evaluate(() => {
+            const pre = document.evaluate('//*[@id="summary"]/section/pre[1]', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (pre && pre.textContent.includes('Error: Unable to create context for gpu variant')) {
+                return 'GPUContextCreationError';
+            }
+
+            const summarySpan = document.evaluate('//*[@id="summary"]/section/p/span', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (summarySpan && (summarySpan.textContent.includes('Error'))) {
+                 return 'HarnessError';
+            }
+            return null;
+       });
+
+       if (crashError) {
+            throw new Error(crashError);
+       }
+
+        await page.waitForTimeout(3000);
+
+        // Wait for results indicator
+        try {
+             // Check if .status selector exists first
+            const hasStatusSelector = await page.evaluate(() => document.querySelector('.status') !== null);
+            if (hasStatusSelector) {
+                await page.waitForSelector('.status', { timeout: navTimeoutMs });
+            } else {
+                await page.waitForFunction(() =>
+                    document.body.textContent.includes('Pass') ||
+                    document.body.textContent.includes('Fail') ||
+                    document.body.textContent.includes('Found') ||
+                    document.body.textContent.includes('test'),
+                    { timeout: navTimeoutMs }
+                );
+            }
+        } catch(e) { /* proceed */ }
+
+        await page.waitForTimeout(2000);
+
+        // Parse results with robust logic from original file
+        // Also scrape detailed failure info if verbose mode is enabled
+        const verboseEnabled = true;
+
+        const resData = await this.parseWptPageResults(page, verboseEnabled);
 
         // If verbose mode is enabled and there are failures but no details captured, try scraping separately
         let failedSubtests = resData.failedSubtests || [];
@@ -786,10 +1072,15 @@ class WptRunner extends WebNNRunner {
     };
 
     try {
-        // Enforce 1 minute global timeout for the test case
+        // Enforce a global per-case timeout (configurable via WPT_CASE_TIMEOUT_MS,
+        // default 180000ms). The error message includes the configured value so
+        // the chunkedExec catch (and retry logic) can identify it as a TIMEOUT.
         return await Promise.race([
             runTest(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout 60000ms exceeded')), 60000))
+            new Promise((_, reject) => setTimeout(
+                () => reject(new Error(`Timeout ${caseTimeoutMs}ms exceeded`)),
+                caseTimeoutMs
+            ))
         ]);
     } catch (e) {
         // Rethrow critical errors to trigger browser restart in chunkedExec

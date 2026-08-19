@@ -352,9 +352,10 @@ Examples:
               try { await browser.close(); } catch (e) {}
           }
           // Kill only our automation's browser process tree (not the user's personal browser).
-          if (browserRootPid) {
-              killOwnBrowserProcesses(browserRootPid);
-          }
+          // Call unconditionally: killOwnBrowserProcesses also sweeps any leftover
+          // chrome/msedge processes launched with our user-data-dir, so it works
+          // even when browserRootPid could not be captured.
+          killOwnBrowserProcesses(browserRootPid);
       });
 
       if (process.env.IS_LIST_MODE === 'true') {
@@ -703,9 +704,13 @@ Examples:
                                let matchCount = 0;
                                results.forEach(r => {
                                    if (r.fullConfig && r.fullConfig.suite !== 'wpt') return;
-                                   // Construct key matching how text report generates it
-                                   // key = `${r.framework}-${r.backend}-${r.deviceName}`
-                                   const key = `${r.framework}-${r.backend}-${r.deviceName}`;
+                                   // Construct key matching how the text report writer generates it
+                                   // (see the group-by loop further below):
+                                   //   keySource = r.configName || fullConfig.name || `${framework}-${backend}-${deviceName||device}`
+                                   const keySource = r.configName ||
+                                       (r.fullConfig && r.fullConfig.name) ||
+                                       `${r.framework}-${r.backend}-${r.deviceName || r.device}`;
+                                   const key = keySource.toString().trim();
                                    const baseline = baselineData[key] && baselineData[key][r.testName];
                                    if (baseline) {
                                        r.previousResult = baseline.status;

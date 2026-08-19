@@ -7,39 +7,178 @@ const nodemailer = require('nodemailer');
 const { chromium } = require('@playwright/test');
 const { getRuntimeInfo, runtimeInfoRows } = require('./runtime-info');
 
-// Kill only browser processes that belong to our automation.
-// Uses the browser root PID (captured at launch) to kill the entire process tree,
-// without affecting the user's personal browser windows.
-function killOwnBrowserProcesses(browserRootPid) {
-    if (!browserRootPid) {
-        console.log('[Warning] No browser PID tracked, skipping targeted cleanup');
-        return 0;
-    }
+// Pause execution for the given number of milliseconds.
+// function sleep(ms) {
+//     return new Promise(resolve => setTimeout(resolve, ms));
+// }
+
+// Absolute path to the user-data-dir we hand to Playwright. This is unique to
+// this workspace and is the reliable fingerprint we use to distinguish our own
+// automation-launched browser processes from the user's personal browser.
+const OWN_USER_DATA_DIR = path.resolve(path.join(__dirname, '..', 'user-data'));
+
+function getOwnUserDataDir() { return OWN_USER_DATA_DIR; }
+
+// Return all PIDs of chrome/msedge processes whose CommandLine references our
+// user-data-dir (i.e. processes we launched). Includes the root process AND
+// any child renderer/GPU/utility processes Chrome inherits the flag on.
+function findOwnBrowserPids(processName = null) {
+    const names = processName ? [processName] : ['chrome.exe', 'msedge.exe'];
+    // Escape backslashes and single-quotes for the PowerShell -like operator.
+    const needle = OWN_USER_DATA_DIR.replace(/\\/g, '\\\\').replace(/'/g, "''");
+    const filter = names.map(n => `Name='${n}'`).join(' OR ');
+    const script =
+        `$ErrorActionPreference='SilentlyContinue';` +
+        `Get-CimInstance Win32_Process -Filter "${filter}" | ` +
+        `Where-Object { $_.CommandLine -and $_.CommandLine -like '*${needle}*' } | ` +
+        `Select-Object -ExpandProperty ProcessId`;
     try {
-        execSync(`taskkill /F /T /PID ${browserRootPid}`, { stdio: 'ignore', timeout: 10000 });
-        console.log(`[Info] Killed browser process tree (root PID: ${browserRootPid})`);
-        return 1;
+        const output = execSync(
+            `powershell -NoProfile -ExecutionPolicy Bypass -Command "${script.replace(/"/g, '\\"')}"`,
+            { encoding: 'utf8', timeout: 10000, windowsHide: true }
+        ).trim();
+        if (!output) return [];
+        return output.split(/\r?\n/)
+            .map(s => parseInt(s.trim(), 10))
+            .filter(n => Number.isFinite(n));
     } catch (e) {
-        // Process may already be dead
-        return 0;
+        return [];
     }
 }
 
-// Find the browser root PID by looking for an msedge/chrome process whose parent
-// is the current Node process (i.e., Playwright spawned it).
-function findBrowserRootPid(processName = 'msedge.exe') {
+// Kill only browser processes that belong to our automation.
+// Strategy:
+//   1. If we have a tracked root PID, kill its whole tree with taskkill /T.
+//   2. Regardless, sweep any remaining chrome/msedge processes whose command
+//      line contains our unique user-data-dir. This catches orphan renderer /
+//      GPU / utility processes that Playwright's close() sometimes leaves
+//      behind, without touching the user's personal browser.
+function killOwnBrowserProcesses(browserRootPid) {
+    let killed = 0;
+
+    if (browserRootPid) {
+        try {
+            execSync(`taskkill /F /T /PID ${browserRootPid}`, { stdio: 'ignore', timeout: 10000 });
+            console.log(`[Info] Killed browser process tree (root PID: ${browserRootPid})`);
+            killed++;
+        } catch (e) {
+            // Process may already be dead — fall through to sweep.
+        }
+    }
+
+    // Fallback / sweep: kill any leftover chrome/msedge that were launched with
+    // our user-data-dir. Safe because that path is unique to this workspace.
+    const leftovers = findOwnBrowserPids();
+    if (leftovers.length > 0) {
+        for (const pid of leftovers) {
+            try {
+                execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore', timeout: 10000 });
+                killed++;
+            } catch (e) { /* already gone */ }
+        }
+        console.log(`[Info] Cleaned up ${leftovers.length} leftover browser process(es) matching own user-data-dir`);
+    } else if (!browserRootPid) {
+        console.log('[Info] No leftover browser processes found for own user-data-dir');
+    }
+
+    return killed;
+}
+
+// -------------------------------------------------------------------------
+// Hang-kill helpers.
+//
+// When a test hangs, Playwright's IPC to Chrome can be permanently stuck
+// (typical after a GPU-process crash or a renderer wedge). In that state
+// every subsequent `page.evaluate`, `page.close`, `context.close`, and
+// even `browser.close` await hangs forever. `Promise.race` on top helps
+// reject the pending promise, but the underlying Playwright call never
+// completes and its `finally`-block cleanup gets stuck as well.
+//
+// The only reliable way out is to kill the OS-level Chrome processes
+// belonging to this automation. Once the browser is gone Playwright's
+// awaiting calls fail immediately with "Target closed" and the recovery
+// path can continue.
+//
+// `armHangKillWatchdog` returns a { disarm } handle. If `timeoutMs`
+// elapses before `disarm()` is called, it force-kills our own Chrome
+// process tree. This is safe: `killOwnBrowserProcesses` only touches
+// browsers launched with our unique user-data-dir.
+//
+// `withHangKill` races an async operation against a timeout. If the
+// timeout fires, Chrome is force-killed (to unblock any pending IPC)
+// and the promise rejects with a labeled timeout error.
+// -------------------------------------------------------------------------
+function armHangKillWatchdog(timeoutMs, label = 'operation', browserRootPid = null) {
+    let fired = false;
+    const timer = setTimeout(() => {
+        fired = true;
+        console.error(`[HangKill] ${label} exceeded ${timeoutMs}ms without completing. Force-killing browser processes to unblock.`);
+        try {
+            killOwnBrowserProcesses(browserRootPid);
+        } catch (e) {
+            console.error(`[HangKill] killOwnBrowserProcesses failed: ${e && e.message || e}`);
+        }
+    }, timeoutMs);
+    return {
+        disarm() { clearTimeout(timer); },
+        fired() { return fired; }
+    };
+}
+
+async function withHangKill(operation, timeoutMs, label = 'operation', browserRootPid = null) {
+    let timer;
+    let killed = false;
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            killed = true;
+            console.error(`[HangKill] ${label} exceeded ${timeoutMs}ms. Force-killing browser processes...`);
+            try { killOwnBrowserProcesses(browserRootPid); } catch (_) {}
+            const err = new Error(`${label} timed out after ${timeoutMs}ms (browser force-killed)`);
+            err.name = 'HangKillTimeoutError';
+            reject(err);
+        }, timeoutMs);
+    });
     try {
-        const tempScript = path.join(os.tmpdir(), `find-browser-${Date.now()}.ps1`);
-        fs.writeFileSync(tempScript,
-            `Get-CimInstance Win32_Process -Filter "Name='${processName}'" | ` +
-            `Where-Object { $_.ParentProcessId -eq ${process.pid} } | ` +
-            `Select-Object -ExpandProperty ProcessId`, 'utf8');
-        const output = execSync(`powershell -ExecutionPolicy Bypass -File "${tempScript}"`, {
-            encoding: 'utf8', timeout: 10000
-        }).trim();
-        try { fs.unlinkSync(tempScript); } catch (e) {}
+        return await Promise.race([
+            Promise.resolve().then(() => operation()),
+            timeoutPromise
+        ]);
+    } finally {
+        clearTimeout(timer);
+        if (killed) {
+            // Give the OS a moment to reap process handles so subsequent
+            // launches don't collide on the user-data-dir lock.
+            await new Promise(r => setTimeout(r, 500));
+        }
+    }
+}
+
+// Find the browser root PID. Preferred: match a chrome/msedge process whose
+// CommandLine contains our unique user-data-dir AND has no chrome/msedge
+// parent (i.e. it's the root, not a renderer child). Falls back to matching
+// by parent = current Node PID for backward compatibility.
+function findBrowserRootPid(processName = 'msedge.exe') {
+    const needle = OWN_USER_DATA_DIR.replace(/\\/g, '\\\\').replace(/'/g, "''");
+    const script =
+        `$ErrorActionPreference='SilentlyContinue';` +
+        `$procs = Get-CimInstance Win32_Process -Filter "Name='${processName}'" | ` +
+        `Where-Object { $_.CommandLine -and $_.CommandLine -like '*${needle}*' };` +
+        `$ownPids = $procs | Select-Object -ExpandProperty ProcessId;` +
+        // A "root" is one whose parent is NOT itself one of our own PIDs
+        // (renderers/GPU processes have the root as parent).
+        `$root = $procs | Where-Object { $ownPids -notcontains $_.ParentProcessId } | ` +
+        `Select-Object -First 1 -ExpandProperty ProcessId;` +
+        `if ($root) { $root } else {` +
+        `  Get-CimInstance Win32_Process -Filter "Name='${processName}'" | ` +
+        `  Where-Object { $_.ParentProcessId -eq ${process.pid} } | ` +
+        `  Select-Object -First 1 -ExpandProperty ProcessId }`;
+    try {
+        const output = execSync(
+            `powershell -NoProfile -ExecutionPolicy Bypass -Command "${script.replace(/"/g, '\\"')}"`,
+            { encoding: 'utf8', timeout: 10000, windowsHide: true }
+        ).trim();
         if (output) {
-            const pid = parseInt(output.split('\n')[0].trim(), 10);
+            const pid = parseInt(output.split(/\r?\n/)[0].trim(), 10);
             if (!isNaN(pid)) return pid;
         }
     } catch (e) { /* best effort */ }
@@ -50,7 +189,7 @@ async function send_email(subject, content, sender = '', to = '') {
     const emailService = {
         serverConfig: {
             host: '',
-            port: port
+            port: 99
         },
         from: '',
         to: ['']
@@ -276,20 +415,13 @@ async function send_email(subject, content, sender = '', to = '') {
   }
 
 async function launchBrowser() {
-    // Ensure stale browser processes do not interfere with a new launch.
-    const browserProcessName = (() => {
-        const browserPath = (process.env.BROWSER_PATH || '').toLowerCase();
-        const channel = (process.env.CHROME_CHANNEL || '').toLowerCase();
-        if (browserPath.includes('msedge') || channel.includes('edge')) {
-            return 'msedge.exe';
-        }
-        return 'chrome.exe';
-    })();
-    try {
-        execSync(`taskkill /F /IM ${browserProcessName} /T`, { stdio: 'ignore', timeout: 10000 });
-        console.log(`[Info] Killed existing ${browserProcessName} processes before launch`);
-    } catch (e) {
-        // Best effort: process may not exist
+    // Ensure stale automation-owned browser processes do not interfere with a
+    // new launch. IMPORTANT: only kill processes launched with our own
+    // user-data-dir — never a blanket `taskkill /IM chrome.exe`, which would
+    // also close the user's personal browser.
+    const staleKilled = killOwnBrowserProcesses(null);
+    if (staleKilled > 0) {
+        console.log(`[Info] Killed ${staleKilled} stale automation-owned browser process(es) before launch`);
     }
 
     // Using flags found in current file + persistent context logic
@@ -335,8 +467,9 @@ async function launchBrowser() {
         launchOptions.channel = 'chrome-canary'; // Default to chrome-canary
    }
 
-   // We use a local persistent directory in the workspace.
-   const userDataDir = path.join(__dirname, '..', 'user-data');
+   // We use a local persistent directory in the workspace. Must match
+   // OWN_USER_DATA_DIR so our process-identification logic can find it.
+   const userDataDir = OWN_USER_DATA_DIR;
    if (!fs.existsSync(userDataDir)) {
        fs.mkdirSync(userDataDir, { recursive: true });
    }
@@ -449,10 +582,16 @@ class WebNNRunner {
     // Hard timeout: when the GPU process crashes, the renderer's IPC channel
     // hangs and ALL Playwright calls (evaluate, isDisabled, goto, etc.) block
     // forever. Promise.race with a timer ensures we abort and recover.
+    // On timeout we ALSO force-kill our own Chrome processes so the awaiting
+    // Playwright calls fail immediately with "Target closed" instead of
+    // staying stuck; otherwise the recovery path (page.close/context.close/
+    // browser.close) hangs too and the whole run wedges.
     let hardTimer;
     const hardTimeoutPromise = new Promise((_, reject) => {
       hardTimer = setTimeout(() => {
         hardTimedOut = true;
+        console.error(`[HangKill] runTestWithSessionCheck exceeded ${timeoutMs}ms. Force-killing browser processes...`);
+        try { killOwnBrowserProcesses(this.browserRootPid); } catch (_) {}
         reject(new Error(`Test hard timeout (${timeoutMs/1000}s) - GPU process may have crashed`));
       }, timeoutMs);
     });
@@ -530,21 +669,40 @@ class WebNNRunner {
 
   async restartBrowserAndContext(browserToClose) {
     if (browserToClose) {
+      // Playwright's close() can hang forever when the browser IPC is stuck
+      // (typical after a GPU crash or a hung test). Race the close against a
+      // short timeout, and if it doesn't complete in time fall through to the
+      // unconditional taskkill sweep below — the OS-level kill will unblock
+      // any pending close() and let us proceed.
+      const closeTimeoutMs = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS, 10) || 15000;
       try {
-        console.log('[Info] Closing browser before restart...');
-        await browserToClose.close();
-        console.log('[Success] Browser closed');
+        console.log(`[Info] Closing browser before restart (timeout ${closeTimeoutMs}ms)...`);
+        await Promise.race([
+          browserToClose.close().then(() => { console.log('[Success] Browser closed'); }),
+          new Promise((_, reject) => setTimeout(
+              () => reject(new Error(`browser.close() timed out after ${closeTimeoutMs}ms`)),
+              closeTimeoutMs
+          ))
+        ]);
       } catch (e) {
-        console.log(`[Warning] Error closing browser: ${e.message}`);
+        console.log(`[Warning] Error / timeout closing browser: ${e.message}. Will force-kill.`);
       }
     }
 
-    // Force kill our browser process tree to ensure clean restart
+    // Force kill our browser process tree to ensure clean restart.
+    // NOTE: Always invoke killOwnBrowserProcesses (not gated on browserRootPid),
+    // because Playwright's soft close() routinely leaves orphan renderer / GPU /
+    // utility processes behind. killOwnBrowserProcesses does an unconditional
+    // sweep of any chrome/msedge process whose command line contains our unique
+    // user-data-dir, which catches those orphans regardless of whether we still
+    // have a tracked root PID.
     if (this.browserRootPid) {
         console.log(`[Info] Killing browser process tree (PID: ${this.browserRootPid})...`);
-        killOwnBrowserProcesses(this.browserRootPid);
-        this.browserRootPid = null;
+    } else {
+        console.log('[Info] Sweeping leftover browser processes matching own user-data-dir...');
     }
+    killOwnBrowserProcesses(this.browserRootPid);
+    this.browserRootPid = null;
 
     // Wait a bit to ensure process is fully gone
     await new Promise(resolve => setTimeout(resolve, 3000));
@@ -638,6 +796,8 @@ class WebNNRunner {
                         findings = modules.filter(m => {
                             const name = (m.ModuleName || '').toLowerCase();
                             const path = (m.FileName || '').toLowerCase();
+                            // ONNX Runtime backends plus the DirectX shader compiler stack
+                            // (dxil.dll / dxcompiler.dll) used by the WebGPU backend.
                             return name.includes('onnxruntime') || name.includes('openvino') || name.includes('directml') || name.includes('tensorrt') || name.includes('migraphx') || name.includes('qnn') || name === 'dxil.dll' || name === 'dxcompiler.dll' ||
                                    path.includes('onnxruntime') || path.includes('openvino') || path.includes('directml') || path.includes('tensorrt') || path.includes('migraphx') || path.includes('qnn') || path.endsWith('\\dxil.dll') || path.endsWith('\\dxcompiler.dll');
                         });
@@ -1987,4 +2147,4 @@ class WebNNPerfCollector {
   }
 }
 
-module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, findBrowserRootPid, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };
+module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, armHangKillWatchdog, withHangKill, findBrowserRootPid, findOwnBrowserPids, getOwnUserDataDir, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };
