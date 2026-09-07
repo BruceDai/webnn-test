@@ -4,7 +4,7 @@ This project contains automated tests for WebNN (Web Neural Network) using Playw
 
 ## Prerequisites
 
-1. **Chrome**: Install Chrome browser (stable, canary, dev, or beta)
+1. **Browser**: Install Chrome or Microsoft Edge (stable, canary, dev, or beta)
 2. **Node.js**: Install Node.js (version 16 or higher)
 3. **Playwright**: Will be installed via npm
 
@@ -31,10 +31,13 @@ node src/main.js --suite wpt --wpt-case abs
 # Run multiple WPT test cases (comma-separated)
 node src/main.js --suite wpt --wpt-case abs,add,mul
 
-# Run with different Chrome channel (stable is default)
+# Run with different Chrome channel (Canary is default)
 node src/main.js --suite wpt --chrome-channel canary
 node src/main.js --suite wpt --chrome-channel dev
 node src/main.js --suite wpt --chrome-channel beta
+
+# Run the WebNN CTS with Edge Canary
+node src/main.js --suite wpt --browser edge --browser-channel canary
 
 # Run with parallel execution (faster)
 node src/main.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 4
@@ -136,6 +139,27 @@ node src/main.js --suite wpt --wpt-case "add,sub" --repeat 3
 node src/main.js --suite wpt --wpt-case "add,sub,mul,div" --jobs 2 --repeat 5
 ```
 
+## Browser Selection
+
+Run the WebNN CTS (the WPT conformance suite) with Chrome or Microsoft Edge:
+
+```bash
+# Chrome Canary (default)
+node src/main.js --suite wpt
+
+# Edge Canary
+node src/main.js --suite wpt --browser edge
+
+# Edge stable
+node src/main.js --suite wpt --browser edge --browser-channel stable
+```
+
+**Supported browsers:** chrome (default), edge
+
+**Supported channels:** canary (default), stable, dev, beta
+
+The older `--chrome-channel` option remains available as an alias for `--browser-channel`.
+
 ## Chrome Channel Selection
 
 Switch between different Chrome channels using `--chrome-channel`:
@@ -154,7 +178,7 @@ node src/main.js --suite wpt --chrome-channel dev
 node src/main.js --suite wpt --chrome-channel beta
 ```
 
-**Supported channels:** stable (default), canary, dev, beta
+**Supported channels:** canary (default), stable, dev, beta
 
 ## Browser Arguments
 

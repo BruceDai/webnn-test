@@ -356,8 +356,9 @@ async function launchBrowser() {
 
    if (process.env.BROWSER_PATH) {
        launchOptions.executablePath = process.env.BROWSER_PATH;
-   } else if (process.env.CHROME_CHANNEL) {
-       launchOptions.channel = process.env.CHROME_CHANNEL;
+   } else if (process.env.BROWSER_CHANNEL || process.env.CHROME_CHANNEL) {
+       // CHROME_CHANNEL is retained as a fallback for older callers.
+       launchOptions.channel = process.env.BROWSER_CHANNEL || process.env.CHROME_CHANNEL;
    } else {
         launchOptions.channel = 'chrome-canary'; // Default to chrome-canary
    }
@@ -368,7 +369,11 @@ async function launchBrowser() {
        fs.mkdirSync(userDataDir, { recursive: true });
    }
 
-   console.log(`[Launch] Launching Chrome from: ${userDataDir}`);
+   const isEdge = (launchOptions.channel || '').startsWith('msedge') ||
+       (process.env.BROWSER_PATH || '').toLowerCase().includes('msedge') ||
+       process.env.BROWSER_NAME === 'edge';
+   const browserName = isEdge ? 'Edge' : 'Chrome';
+   console.log(`[Launch] Launching ${browserName} from: ${userDataDir}`);
 
    let context, page, browser;
 

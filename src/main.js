@@ -47,6 +47,15 @@ const getBackend = (framework, browserArgs, dllResults, device) => {
     return 'cpu'; // Default fallback
 };
 
+const getBrowserProcessName = () => {
+    const browserPath = (process.env.BROWSER_PATH || '').toLowerCase();
+    const browserName = (process.env.BROWSER_NAME || '').toLowerCase();
+    const browserChannel = (process.env.BROWSER_CHANNEL || process.env.CHROME_CHANNEL || '').toLowerCase();
+    return browserPath.includes('msedge') || browserName === 'edge' || browserChannel.startsWith('msedge')
+        ? 'msedge.exe'
+        : 'chrome.exe';
+};
+
 if (require.main === module && process.env.IS_PLAYWRIGHT_CHILD_PROCESS !== 'true') {
   // ===========================================================================
   // CLI / Parent Process Logic
@@ -68,8 +77,10 @@ Options:
   --jobs <number>          Number of parallel jobs (default: 4)
   --repeat <number>        Number of times to repeat the test run (default: 1)
   --device <type>          Device type to use (default: gpu). Values: cpu, gpu, npu
-  --chrome-channel <name>  Chrome channel to use (default: canary). Values: stable, canary, dev, beta
-  --browser-arg <arg>     Extra arguments for browser launch, split by space
+  --browser <name>         Browser to use (default: chrome). Values: chrome, edge
+  --browser-channel <name> Browser channel to use (default: canary). Values: stable, canary, dev, beta
+  --chrome-channel <name>  Deprecated alias for --browser-channel
+  --browser-arg <arg>      Extra arguments for browser launch, split by space
   --email [address]        Send email report
   --pause <case>           Pause execution on failure
   --browser-path <path>    Custom path to browser executable
@@ -84,6 +95,7 @@ Test Selection:
 Examples:
   node src/main.js --config config.json
   node src/main.js --suite wpt --wpt-case abs
+  node src/main.js --suite wpt --browser edge --browser-channel canary
 `);
     process.exit(0);
   }
@@ -122,15 +134,24 @@ Examples:
       }
   }
 
-  const chromeChannel = (getArg('--chrome-channel') || 'canary').toLowerCase();
+  const browserName = (getArg('--browser') || 'chrome').toLowerCase();
+  const validBrowsers = ['chrome', 'edge'];
+  if (!validBrowsers.includes(browserName)) {
+      console.error(`Invalid --browser value: ${browserName}`);
+      console.error(`Valid browsers are: ${validBrowsers.join(', ')}`);
+      process.exit(1);
+  }
+
+  const browserChannel = (getArg('--browser-channel') || getArg('--chrome-channel') || 'canary').toLowerCase();
   const validChannels = ['canary', 'dev', 'beta', 'stable'];
-  if (!validChannels.includes(chromeChannel)) {
-      console.error(`Invalid --chrome-channel value: ${chromeChannel}`);
+  if (!validChannels.includes(browserChannel)) {
+      console.error(`Invalid --browser-channel value: ${browserChannel}`);
       console.error(`Valid channels are: ${validChannels.join(', ')}`);
       process.exit(1);
   }
 
-  let playwrightChannel = (chromeChannel === 'stable') ? 'chrome' : `chrome-${chromeChannel}`;
+  const channelPrefix = browserName === 'edge' ? 'msedge' : 'chrome';
+  const playwrightChannel = browserChannel === 'stable' ? channelPrefix : `${channelPrefix}-${browserChannel}`;
 
   const globalExtraArgs = getArg('--browser-arg');
   const browserPath = getArg('--browser-path');
@@ -205,7 +226,8 @@ Examples:
 
   // --- Environment Setup ---
   process.env.JOBS = jobs.toString();
-  process.env.CHROME_CHANNEL = playwrightChannel;
+  process.env.BROWSER_NAME = browserName;
+  process.env.BROWSER_CHANNEL = playwrightChannel;
   process.env.TEST_CONFIG_LIST = JSON.stringify(runConfigs);
   process.env.IS_LIST_MODE = process.env.LIST_MODE;
   if (emailAddress) {
@@ -399,18 +421,17 @@ Examples:
 
                    // Track the browser root PID for targeted cleanup
                    try {
-                       const bPath = (process.env.BROWSER_PATH || '').toLowerCase();
-                       const pName = (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge')) ? 'msedge.exe' : 'chrome.exe';
-                       browserRootPid = findBrowserRootPid(pName);
+                       browserRootPid = findBrowserRootPid(getBrowserProcessName());
                        if (browserRootPid) console.log(`[Info] Browser root PID: ${browserRootPid}`);
                    } catch (e) { /* best effort */ }
 
                    // Capture browser info on first launch
                    if (!browserInfo) {
                        try {
-                           const channel = process.env.CHROME_CHANNEL || 'chrome-canary';
-                           let name = 'Chrome';
-                           if (channel.includes('edge')) name = 'Edge';
+                           const channel = process.env.BROWSER_CHANNEL || process.env.CHROME_CHANNEL || 'chrome-canary';
+                           const browserPath = (process.env.BROWSER_PATH || '').toLowerCase();
+                           const isEdge = channel.startsWith('msedge') || process.env.BROWSER_NAME === 'edge' || browserPath.includes('msedge');
+                           const name = isEdge ? 'Edge' : 'Chrome';
 
                            // Get full version via CDP (Browser.getVersion returns the real version)
                            let version = 'Unknown';
@@ -423,7 +444,7 @@ Examples:
                                await cdp.detach();
                            } catch (_) {}
 
-                           const channelLabel = channel.replace('chrome-', '').replace('chrome', 'stable');
+                           const channelLabel = channel.replace(/^(chrome|msedge)-?/, '') || 'stable';
                            browserInfo = {
                                name: name,
                                channel: channelLabel.charAt(0).toUpperCase() + channelLabel.slice(1),
@@ -447,7 +468,6 @@ Examples:
                    runner = currentRunner;
 
                    if (idx === 0) {
-                        // const processName = (process.env.CHROME_CHANNEL || '').includes('edge') ? 'msedge.exe' : 'chrome.exe';
                         // Short delay to ensure process is stable
                         // await new Promise(r => setTimeout(r, 2000));
                         // dllResults = await currentRunner.checkOnnxruntimeDlls(processName);
@@ -461,10 +481,8 @@ Examples:
                    // Callback to run DLL check after first case execution
                    const onFirstCaseComplete = async () => {
                        if (!currentDllResults) {
-                           const bPath = (process.env.BROWSER_PATH || '').toLowerCase();
-                           const processName = (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge')) ? 'msedge.exe' : 'chrome.exe';
                            console.log('[Info] First case completed. Checking DLLs...');
-                           currentDllResults = await currentRunner.checkOnnxruntimeDlls(processName);
+                           currentDllResults = await currentRunner.checkOnnxruntimeDlls(getBrowserProcessName());
                        }
                    };
 
@@ -757,4 +775,3 @@ Examples:
       }
   });
 }
-
