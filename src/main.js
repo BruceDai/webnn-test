@@ -9,6 +9,7 @@ const { test, expect, chromium } = require('@playwright/test');
 const { WptRunner } = require('./wpt');
 const { ModelRunner } = require('./model');
 const { launchBrowser, killOwnBrowserProcesses, findBrowserRootPid, get_gpu_info, get_cpu_info, get_npu_info } = require('./util');
+const { getRuntimeInfo, runtimeInfoRows, resolveWindowsAppSdk, verifyWindowsAppSdk } = require('./runtime-info');
 
 // Helper to parse comma-separated lists
 const parseList = (str) => (str || '').split(',').map(s => s.trim()).filter(s => s.length > 0);
@@ -84,6 +85,7 @@ Options:
   --email [address]        Send email report
   --pause <case>           Pause execution on failure
   --browser-path <path>    Custom path to browser executable
+  --win-app-sdk <package>  Select an installed Windows App SDK runtime package and verify ONNX Runtime uses it (enables WebNNOnnxRuntime)
   --skip-retry             Skip the retry stage for failed tests
   --baseline <folder>      Baseline folder (timestamp) for comparison
 
@@ -153,7 +155,21 @@ Examples:
   const channelPrefix = browserName === 'edge' ? 'msedge' : 'chrome';
   const playwrightChannel = browserChannel === 'stable' ? channelPrefix : `${channelPrefix}-${browserChannel}`;
 
-  const globalExtraArgs = getArg('--browser-arg');
+  let globalExtraArgs = getArg('--browser-arg');
+  const sdkPackage = getArg('--win-app-sdk');
+  if (sdkPackage) {
+      try {
+          const sdk = resolveWindowsAppSdk(sdkPackage);
+          process.env.WEBNN_EXPECTED_SDK_PATH = sdk.InstallLocation;
+          console.log(`[SDK] Selected ${sdk.Name} ${sdk.Version}: ${sdk.InstallLocation}`);
+          globalExtraArgs = `${globalExtraArgs || ''} --enable-features=WebNNOnnxRuntime`.trim();
+      } catch (error) {
+          console.error(`[SDK] ${error.message}`);
+          process.exit(1);
+      }
+  } else {
+      delete process.env.WEBNN_EXPECTED_SDK_PATH;
+  }
   const browserPath = getArg('--browser-path');
   const skipRetry = args.includes('--skip-retry');
   const baseline = getArg('--baseline');
@@ -496,6 +512,11 @@ Examples:
                    // Ensure check ran if for some reason callback wasn't triggered (e.g. 0 tests)
                    if (!currentDllResults) await onFirstCaseComplete();
 
+                   if (process.env.WEBNN_EXPECTED_SDK_PATH) {
+                       verifyWindowsAppSdk(currentDllResults, process.env.WEBNN_EXPECTED_SDK_PATH);
+                       console.log(`[SDK] Verified ONNX Runtime loaded from ${process.env.WEBNN_EXPECTED_SDK_PATH}`);
+                   }
+
                    const fw = getFramework(config.browserArgs);
                    const bk = getBackend(fw, config.browserArgs, currentDllResults, config.device);
 
@@ -689,7 +710,8 @@ Examples:
                    }
                    // -----------------------------------
 
-                   const report = runner.generateHtmlReport(suiteNames, subtitle, results, allDllResults, wallTime, sumOfTestTimes, baselineDirName, browserInfo);
+                   const runtimeInfo = getRuntimeInfo(allDllResults);
+                   const report = runner.generateHtmlReport(suiteNames, subtitle, results, allDllResults, wallTime, sumOfTestTimes, baselineDirName, browserInfo, runtimeInfo);
 
                    const runDir = process.env.PROJECT_RUN_DIR || path.join(__dirname, '..', 'results');
                    const timestamp = process.env.PROJECT_TIMESTAMP;
@@ -709,6 +731,9 @@ Examples:
                        let sysInfoText = '=== System Information ===\n';
                        if (browserInfo) {
                            sysInfoText += `Browser: ${browserInfo.name} ${browserInfo.channel} ${browserInfo.version}\n`;
+                       }
+                       for (const [label, value] of runtimeInfoRows(runtimeInfo)) {
+                           sysInfoText += `${label}:\n  ${value.replace(/\n/g, '\n  ')}\n`;
                        }
                        if (sysCpuInfo) sysInfoText += `CPU: ${sysCpuInfo}\n`;
                        if (sysGpuInfo) {

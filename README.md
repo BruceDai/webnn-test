@@ -160,25 +160,38 @@ node src/main.js --suite wpt --browser edge --browser-channel stable
 
 The older `--chrome-channel` option remains available as an alias for `--browser-channel`.
 
-## Chrome Channel Selection
+## Browser Channel Selection
 
-Switch between different Chrome channels using `--chrome-channel`:
+Switch between Chrome and Edge channels using `--browser-channel`:
 
 ```bash
-# Use stable Chrome (default)
-node src/main.js --suite wpt
+# Use stable Chrome
+node src/main.js --suite wpt --browser-channel stable
 
 # Use Chrome Canary
-node src/main.js --suite wpt --chrome-channel canary
+node src/main.js --suite wpt --browser-channel canary
 
 # Use Chrome Dev
-node src/main.js --suite wpt --chrome-channel dev
+node src/main.js --suite wpt --browser-channel dev
 
 # Use Chrome Beta
-node src/main.js --suite wpt --chrome-channel beta
+node src/main.js --suite wpt --browser-channel beta
+
+# Run an Edge Canary smoke test
+node src/main.js --suite wpt --wpt-case "abs,add" --device cpu,gpu --jobs 1 --browser edge --browser-channel canary --browser-arg "--enable-features=WebNNOnnxRuntime" --skip-retry
+
+# Require the installed 2.4 experimental SDK for an Edge Canary smoke test
+node src/main.js --suite wpt --wpt-case "abs,add" --device cpu,gpu --jobs 1 --browser edge --browser-channel canary --win-app-sdk Microsoft.WindowsAppRuntime.2-experimentalB --skip-retry
 ```
 
 **Supported channels:** canary (default), stable, dev, beta
+
+`--win-app-sdk <package-name>` selects the latest installed version of that runtime
+package for the runner's architecture and enables `WebNNOnnxRuntime`. It uses
+Chromium's `--webnn-ort-library-path-for-testing` override with
+`--allow-third-party-modules`. After each configuration, the runner verifies the
+loaded `onnxruntime.dll` path and fails if it cannot confirm the selected runtime.
+This selects the ONNX Runtime library; EP packages remain selected by the browser.
 
 ## Browser Arguments
 
@@ -239,6 +252,7 @@ Baseline directories are looked up under the `results/` folder. Directories pref
 After test execution completes, an HTML report is automatically generated with:
 
 - **WebNN Test Report Section**: Displays in attachments section at the bottom of the page with comprehensive test results
+  - Runtime Information at the top lists ORT, Windows App SDK, and execution provider (EP) versions used by the run, with EP package and DLL versions when available; the text report includes the same snapshot
   - Test execution summary (passed, failed, error, unknown counts)
   - Detailed results for each test case with status and timing
   - Color-coded status indicators for easy identification

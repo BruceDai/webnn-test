@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { chromium } = require('@playwright/test');
+const { getRuntimeInfo, runtimeInfoRows } = require('./runtime-info');
 
 // Kill only browser processes that belong to our automation.
 // Uses the browser root PID (captured at launch) to kill the entire process tree,
@@ -346,6 +347,12 @@ async function launchBrowser() {
                args.push(arg);
            }
        });
+   }
+
+   if (process.env.WEBNN_EXPECTED_SDK_PATH) {
+       // Chromium requires this opt-in for its development runtime override.
+       args.push('--allow-third-party-modules');
+       args.push(`--webnn-ort-library-path-for-testing=${process.env.WEBNN_EXPECTED_SDK_PATH}`);
    }
 
    const launchOptions = {
@@ -792,7 +799,7 @@ class WebNNRunner {
     });
   }
 
-  generateHtmlReport(testSuites, testCase, results, dllCheckResults = null, wallTime = null, sumOfTestTimes = null, baselineDirName = null, browserInfo = null) {
+  generateHtmlReport(testSuites, testCase, results, dllCheckResults = null, wallTime = null, sumOfTestTimes = null, baselineDirName = null, browserInfo = null, runtimeInfo = null) {
     const totalSubcases = results.reduce((sum, r) => sum + r.subcases.total, 0);
     const passedSubcases = results.reduce((sum, r) => sum + r.subcases.passed, 0);
     const failedSubcases = results.reduce((sum, r) => sum + r.subcases.failed, 0);
@@ -881,6 +888,21 @@ class WebNNRunner {
             </div>
         </div>`;
     }
+
+    const escapeHtml = (value) => String(value).replace(/[&<>"']/g, char => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[char]));
+    const runtimeRows = runtimeInfoRows(runtimeInfo || getRuntimeInfo(dllCheckResults));
+    deviceInfoHtml += `
+        <div style="background-color: #e0f7fa; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #80deea;">
+            <h3 style="margin-top: 0; color: #006064;">Runtime Information</h3>
+            <div style="display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: center;">
+                ${runtimeRows.map(([label, value]) => `
+                <div style="font-weight: bold; color: #00838f;">${escapeHtml(label)}:</div>
+                <div style="white-space: pre-wrap; overflow-wrap: anywhere;">${escapeHtml(value)}</div>
+                `).join('')}
+            </div>
+        </div>`;
 
     // CPU Info (if any test ran on cpu)
     const hasCpuTest = results.some(r => r.device === 'cpu');
