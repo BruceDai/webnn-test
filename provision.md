@@ -8,10 +8,9 @@ The installer registers `Microsoft.WindowsAppRuntime.2-experimentalB` version
 `2.4.1.0`. Run normally to install for the current user, or as an Administrator
 to provision for all users. Existing stable runtimes can remain installed.
 
-To test using this experimental runtime, pass
-`--win-app-sdk Microsoft.WindowsAppRuntime.2-experimentalB` to `src/main.js`.
-The runner verifies the loaded ONNX Runtime DLL path; installing the experimental
-package by itself does not change the runtime selected by Edge or Chrome.
+On Windows, `src/main.js` selects the latest installed preview or experimental
+runtime automatically and verifies the loaded ONNX Runtime DLL path. The runner
+does not download SDK updates automatically.
 
 # Install EPs
 ExecutionProviderCatalog.exe

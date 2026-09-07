@@ -3,25 +3,49 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
-function resolveWindowsAppSdk(packageName) {
-    if (os.platform() !== 'win32') throw new Error('--win-app-sdk requires Windows');
-    if (!/^Microsoft\.WindowsAppRuntime\.\d[\w.-]*$/.test(packageName)) {
-        throw new Error('Expected a Windows App SDK runtime package name, for example Microsoft.WindowsAppRuntime.2-experimentalB');
-    }
+function selectWindowsAppSdk(packages, architecture = process.arch) {
+    const arch = architecture === 'ia32' ? 'x86' : architecture;
+    const candidates = packages.filter(sdk =>
+        /^Microsoft\.WindowsAppRuntime\.\d[\w.-]*$/i.test(sdk.Name) &&
+        sdk.Architecture.toLowerCase() === arch.toLowerCase() &&
+        /-(preview|experimental)/i.test(sdk.Name)
+    );
+    // SDK 1.x used package versions like 8000.x. SDK 2.x uses 2.x.
+    // Compare the SDK generation first so an old 1.8 runtime cannot outrank 2.x.
+    const versionParts = sdk => [
+        Number(sdk.Name.match(/^Microsoft\.WindowsAppRuntime\.(\d+)/i)[1]),
+        ...sdk.Version.split('.').map(Number)
+    ];
+    candidates.sort((a, b) => {
+        const left = versionParts(a);
+        const right = versionParts(b);
+        for (let i = 0; i < Math.max(left.length, right.length); i++) {
+            const difference = (right[i] || 0) - (left[i] || 0);
+            if (difference) return difference;
+        }
+        return b.Name.localeCompare(a.Name, undefined, { numeric: true });
+    });
+    return candidates[0] || null;
+}
+
+function resolveWindowsAppSdk() {
+    if (os.platform() !== 'win32') throw new Error('Windows App SDK selection requires Windows');
     const script = `
         $ErrorActionPreference = 'Stop'
-        Get-AppxPackage -Name $env:WEBNN_SDK_PACKAGE | Where-Object {
-            $_.Architecture.ToString() -eq $env:WEBNN_SDK_ARCH
-        } | Sort-Object { [version]$_.Version } -Descending |
-            Select-Object -First 1 Name, Version, InstallLocation | ConvertTo-Json -Compress
+        $packages = @(Get-AppxPackage -Name 'Microsoft.WindowsAppRuntime.*' |
+            Select-Object Name, @{N='Version';E={$_.Version.ToString()}},
+                @{N='Architecture';E={$_.Architecture.ToString()}}, InstallLocation)
+        ConvertTo-Json -InputObject $packages -Compress
     `;
     const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-        encoding: 'utf8', windowsHide: true, timeout: 30000,
-        env: { ...process.env, WEBNN_SDK_PACKAGE: packageName, WEBNN_SDK_ARCH: process.arch === 'ia32' ? 'x86' : process.arch }
+        encoding: 'utf8', windowsHide: true, timeout: 30000
     }).trim();
-    const sdk = output ? JSON.parse(output) : null;
-    if (!sdk || !fs.existsSync(path.join(sdk.InstallLocation, 'onnxruntime.dll'))) {
-        throw new Error(`No ${process.arch} ONNX Runtime installation found for ${packageName}`);
+    const sdk = selectWindowsAppSdk(JSON.parse(output || '[]'));
+    if (!sdk) {
+        throw new Error(`No ${process.arch} preview or experimental Windows App SDK runtime is installed. Install one from https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/downloads.`);
+    }
+    if (!fs.existsSync(path.join(sdk.InstallLocation, 'onnxruntime.dll'))) {
+        throw new Error(`Selected Windows App SDK package ${sdk.Name} ${sdk.Version} does not contain onnxruntime.dll`);
     }
     return sdk;
 }
@@ -87,4 +111,4 @@ function runtimeInfoRows(info) {
     ];
 }
 
-module.exports = { getRuntimeInfo, runtimeInfoRows, resolveWindowsAppSdk, verifyWindowsAppSdk };
+module.exports = { getRuntimeInfo, runtimeInfoRows, selectWindowsAppSdk, resolveWindowsAppSdk, verifyWindowsAppSdk };

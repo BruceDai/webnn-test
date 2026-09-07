@@ -85,7 +85,6 @@ Options:
   --email [address]        Send email report
   --pause <case>           Pause execution on failure
   --browser-path <path>    Custom path to browser executable
-  --win-app-sdk <package>  Select an installed Windows App SDK runtime package and verify ONNX Runtime uses it (enables WebNNOnnxRuntime)
   --skip-retry             Skip the retry stage for failed tests
   --baseline <folder>      Baseline folder (timestamp) for comparison
 
@@ -156,10 +155,9 @@ Examples:
   const playwrightChannel = browserChannel === 'stable' ? channelPrefix : `${channelPrefix}-${browserChannel}`;
 
   let globalExtraArgs = getArg('--browser-arg');
-  const sdkPackage = getArg('--win-app-sdk');
-  if (sdkPackage) {
+  if (os.platform() === 'win32' && process.env.LIST_MODE !== 'true') {
       try {
-          const sdk = resolveWindowsAppSdk(sdkPackage);
+          const sdk = resolveWindowsAppSdk();
           process.env.WEBNN_EXPECTED_SDK_PATH = sdk.InstallLocation;
           console.log(`[SDK] Selected ${sdk.Name} ${sdk.Version}: ${sdk.InstallLocation}`);
           globalExtraArgs = `${globalExtraArgs || ''} --enable-features=WebNNOnnxRuntime`.trim();

@@ -177,18 +177,20 @@ node src/main.js --suite wpt --browser-channel dev
 # Use Chrome Beta
 node src/main.js --suite wpt --browser-channel beta
 
-# Run an Edge Canary smoke test
-node src/main.js --suite wpt --wpt-case "abs,add" --device cpu,gpu --jobs 1 --browser edge --browser-channel canary --browser-arg "--enable-features=WebNNOnnxRuntime" --skip-retry
-
-# Require the installed 2.4 experimental SDK for an Edge Canary smoke test
-node src/main.js --suite wpt --wpt-case "abs,add" --device cpu,gpu --jobs 1 --browser edge --browser-channel canary --win-app-sdk Microsoft.WindowsAppRuntime.2-experimentalB --skip-retry
+# Run an Edge Canary smoke test using the latest installed preview/experimental SDK
+node src/main.js --suite wpt --wpt-case "abs,add" --device cpu,gpu --jobs 1 --browser edge --browser-channel canary --skip-retry
 ```
 
 **Supported channels:** canary (default), stable, dev, beta
 
-`--win-app-sdk <package-name>` selects the latest installed version of that runtime
-package for the runner's architecture and enables `WebNNOnnxRuntime`. It uses
-Chromium's `--webnn-ort-library-path-for-testing` override with
+On Windows, test runs select the latest installed **preview or experimental**
+Windows App SDK for the runner's architecture and enable `WebNNOnnxRuntime` by
+default. Selection compares the SDK generation before the numeric package version,
+so older 1.x packages with `8000.x` versions do not outrank 2.x releases. If none is
+installed, the run stops with an installation hint. Help and test listing do not
+require an SDK. This selects installed packages; it does not download updates.
+
+Selection uses Chromium's `--webnn-ort-library-path-for-testing` override with
 `--allow-third-party-modules`. After each configuration, the runner verifies the
 loaded `onnxruntime.dll` path and fails if it cannot confirm the selected runtime.
 This selects the ONNX Runtime library; EP packages remain selected by the browser.
