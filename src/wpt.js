@@ -2,7 +2,7 @@
 const { test } = require('@playwright/test');
 const fs = require('fs');
 const path = require('path');
-const { WebNNRunner, killOwnBrowserProcesses, armHangKillWatchdog, withHangKill } = require('./util');
+const { WebNNRunner, killOwnBrowserProcesses, armHangKillWatchdog, withHangKill, removeOwnUserDataDir } = require('./util');
 
 class WptRunner extends WebNNRunner {
     writeFinalResultsCsv(results) {
@@ -19,9 +19,30 @@ class WptRunner extends WebNNRunner {
         for (const r of results) {
             const backend = r.backend;
             const caseName = testCaseName(r);
+            // Prefer the full per-subtest list (includes PASS rows) so the CSV
+            // records every subcase result, not only failures. Fall back to
+            // the failure-only list when a full list wasn't captured (e.g.
+            // partial scrape after timeout).
+            const hasAllSubtests = Array.isArray(r.allSubtests) && r.allSubtests.length > 0;
             const hasFailedSubtests = Array.isArray(r.failedSubtests) && r.failedSubtests.length > 0;
 
-            if (hasFailedSubtests) {
+            if (hasAllSubtests) {
+                for (const s of r.allSubtests) {
+                    const subName = s.name || 'subtest';
+                    const status = (s.status || r.result || 'UNKNOWN').toString().toUpperCase();
+                    // Only include a message for non-PASS entries — PASS rows
+                    // don't carry a meaningful message and the extra column
+                    // just bloats the CSV.
+                    const message = status === 'PASS' ? '' : (s.message || '');
+                    lines.push([
+                        backend,
+                        'WPT',
+                        `${caseName} - ${subName}`,
+                        status,
+                        message
+                    ].map(csvEscape).join(','));
+                }
+            } else if (hasFailedSubtests) {
                 // Emit one row per failed subtest so each failure is on its own line.
                 for (const s of r.failedSubtests) {
                     const subName = s.name || 'subtest';
@@ -215,14 +236,21 @@ class WptRunner extends WebNNRunner {
                          page = await currentContext.newPage();
                          // Run test (Attempt 0)
                          const start = Date.now();
+                         // NOTE: capture the timer id and clear it after the race
+                         // resolves. A bare `Promise.race([op, new Promise(setTimeout(reject))])`
+                         // leaks the timer whenever `op` wins — Node keeps the
+                         // event loop alive waiting for the stale timer, which
+                         // is why the LAST WPT test appeared to hang for up to
+                         // `chunkTimeoutMs` after completing successfully.
+                         let chunkTimeoutId;
                          const res = await Promise.race([
                              this.runSingleWptTest(page, testFile, i, files.length, 0),
                              new Promise((_, reject) => {
                                  const timeoutError = new Error(`Test timeout ${chunkTimeoutMs}ms exceeded`);
                                  timeoutError.name = 'ChunkedExecTimeoutError';
-                                 setTimeout(() => reject(timeoutError), chunkTimeoutMs);
+                                 chunkTimeoutId = setTimeout(() => reject(timeoutError), chunkTimeoutMs);
                              })
-                         ]);
+                         ]).finally(() => clearTimeout(chunkTimeoutId));
                          res.executionTime = ((Date.now() - start) / 1000).toFixed(2);
                          res.fileName = testFile; // Store filename for retry
 
@@ -277,17 +305,22 @@ class WptRunner extends WebNNRunner {
                              // case status stays TIMEOUT.
                              let partialSubcases = { total: 1, passed: 0, failed: 1 };
                              let partialFailedSubtests;
+                             let partialAllSubtests;
                              let partialSummary = '';
                              try {
                                  if (page && !page.isClosed()) {
+                                     let partialTimeoutId;
                                      const partial = await Promise.race([
                                          this.parseWptPageResults(page, true),
-                                         new Promise((resolve) => setTimeout(() => resolve(null), 5000))
-                                     ]);
+                                         new Promise((resolve) => { partialTimeoutId = setTimeout(() => resolve(null), 5000); })
+                                     ]).finally(() => clearTimeout(partialTimeoutId));
                                      if (partial && partial.subcases && partial.subcases.total > 0) {
                                          partialSubcases = partial.subcases;
                                          if (partial.failedSubtests && partial.failedSubtests.length > 0) {
                                              partialFailedSubtests = partial.failedSubtests;
+                                         }
+                                         if (partial.allSubtests && partial.allSubtests.length > 0) {
+                                             partialAllSubtests = partial.allSubtests;
                                          }
                                          partialSummary = ` Partial: ${partial.subcases.passed}P/${partial.subcases.failed}F/${partial.subcases.total}T.`;
                                      }
@@ -305,6 +338,7 @@ class WptRunner extends WebNNRunner {
                                  result: 'TIMEOUT',
                                  subcases: partialSubcases,
                                  failedSubtests: partialFailedSubtests,
+                                 allSubtests: partialAllSubtests,
                                  error: `${e.message}.${partialSummary}`
                              });
 
@@ -376,16 +410,21 @@ class WptRunner extends WebNNRunner {
                          // (taskkill) and will unblock anything still pending.
                          const guardedClose = async (closable, label) => {
                              if (!closable) return;
+                             let closeTimeoutId;
                              try {
                                  await Promise.race([
                                      closable.close(),
-                                     new Promise((_, reject) => setTimeout(
-                                         () => reject(new Error(`${label}.close() timeout ${closeOpTimeoutMs}ms`)),
-                                         closeOpTimeoutMs
-                                     ))
+                                     new Promise((_, reject) => {
+                                         closeTimeoutId = setTimeout(
+                                             () => reject(new Error(`${label}.close() timeout ${closeOpTimeoutMs}ms`)),
+                                             closeOpTimeoutMs
+                                         );
+                                     })
                                  ]);
                              } catch (err) {
                                  console.log(`[Warning] ${label}.close() failed/timed out: ${err.message}`);
+                             } finally {
+                                 clearTimeout(closeTimeoutId);
                              }
                          };
                          if (page && !page.isClosed()) {
@@ -406,6 +445,12 @@ class WptRunner extends WebNNRunner {
                              this.page = null;
                          } catch (_) {}
                          try { killOwnBrowserProcesses(null); } catch(e) {}
+                         // Force-remove the user-data directory after every
+                         // WPT test so the next test starts from a pristine
+                         // profile (no cached shaders, no restore tabs, no
+                         // leftover lock file). Must come AFTER the process
+                         // kill so no browser is holding these files.
+                         try { removeOwnUserDataDir({ quiet: true }); } catch(e) {}
                          // Disarm the per-step hang-kill watchdog. If it
                          // already fired we log; the sweep above has already
                          // killed the browser so the next test will relaunch.
@@ -531,6 +576,11 @@ class WptRunner extends WebNNRunner {
                              result.subcases = res.subcases;
                              result.error = undefined;
                              result.crashed = false;
+                             // Retry produced a fresh (and now authoritative) set of
+                             // subtest details — propagate them so TXT / CSV reports
+                             // reflect the retry outcome, not the first-pass failure.
+                             result.failedSubtests = res.failedSubtests;
+                             result.allSubtests = res.allSubtests;
                              // Strip any leading [CRASH] label added on the first pass so
                              // the reported case name reflects the retry outcome.
                              if (typeof result.testName === 'string') {
@@ -554,6 +604,11 @@ class WptRunner extends WebNNRunner {
                             (!res.subcases || (res.subcases.total === 0 && res.subcases.passed === 0 && res.subcases.failed === 0));
                         if (!retryUnparseable) {
                             result.subcases = res.subcases;
+                            // Keep subtest detail arrays in sync with the retry's
+                            // subcase counts. When we accept the retry's totals
+                            // we must also accept its per-subtest breakdown.
+                            result.failedSubtests = res.failedSubtests;
+                            result.allSubtests = res.allSubtests;
                         }
                         result.error = res.error;
                         result.crashed = !!res.crashed;
@@ -595,18 +650,23 @@ class WptRunner extends WebNNRunner {
                             // retry page produced before our per-case cap fired.
                             let partialSubcases = null;
                             let partialFailedSubtests;
+                            let partialAllSubtests;
                             let partialSummary = '';
                             try {
                                 const retryPage = retryInstance && retryInstance.page;
                                 if (retryPage && !retryPage.isClosed()) {
+                                    let retryPartialTimeoutId;
                                     const partial = await Promise.race([
                                         this.parseWptPageResults(retryPage, true),
-                                        new Promise((resolve) => setTimeout(() => resolve(null), 5000))
-                                    ]);
+                                        new Promise((resolve) => { retryPartialTimeoutId = setTimeout(() => resolve(null), 5000); })
+                                    ]).finally(() => clearTimeout(retryPartialTimeoutId));
                                     if (partial && partial.subcases && partial.subcases.total > 0) {
                                         partialSubcases = partial.subcases;
                                         if (partial.failedSubtests && partial.failedSubtests.length > 0) {
                                             partialFailedSubtests = partial.failedSubtests;
+                                        }
+                                        if (partial.allSubtests && partial.allSubtests.length > 0) {
+                                            partialAllSubtests = partial.allSubtests;
                                         }
                                         partialSummary = ` Partial: ${partial.subcases.passed}P/${partial.subcases.failed}F/${partial.subcases.total}T.`;
                                     }
@@ -629,6 +689,9 @@ class WptRunner extends WebNNRunner {
                                 }
                                 if (partialFailedSubtests) {
                                     result.failedSubtests = partialFailedSubtests;
+                                }
+                                if (partialAllSubtests) {
+                                    result.allSubtests = partialAllSubtests;
                                 }
                                 if (typeof result.testName === 'string') {
                                     result.testName = result.testName.replace(/^\s*\[CRASH\]\s*/, '');
@@ -677,16 +740,21 @@ class WptRunner extends WebNNRunner {
                         if (retryInstance) {
                             const guardedRetryClose = async (closable, label) => {
                                 if (!closable) return;
+                                let retryCloseTimeoutId;
                                 try {
                                     await Promise.race([
                                         closable.close(),
-                                        new Promise((_, reject) => setTimeout(
-                                            () => reject(new Error(`retry ${label}.close() timeout ${closeOpTimeoutMs}ms`)),
-                                            closeOpTimeoutMs
-                                        ))
+                                        new Promise((_, reject) => {
+                                            retryCloseTimeoutId = setTimeout(
+                                                () => reject(new Error(`retry ${label}.close() timeout ${closeOpTimeoutMs}ms`)),
+                                                closeOpTimeoutMs
+                                            );
+                                        })
                                     ]);
                                 } catch (err) {
                                     console.log(`[Warning] retry ${label}.close() failed/timed out: ${err.message}`);
+                                } finally {
+                                    clearTimeout(retryCloseTimeoutId);
                                 }
                             };
                             try {
@@ -703,6 +771,10 @@ class WptRunner extends WebNNRunner {
                         // processes behind. Sweep any chrome/msedge processes still using our
                         // user-data-dir so we don't accumulate dozens of processes over a run.
                         try { killOwnBrowserProcesses(null); } catch(e) {}
+                        // Force-remove the user-data directory after every
+                        // retry attempt so the next attempt starts from a
+                        // pristine profile.
+                        try { removeOwnUserDataDir({ quiet: true }); } catch(e) {}
                         if (retryHangWatchdog.fired()) {
                             console.error(`[HangKill] Retry ${attempt} for ${testFile} was force-killed after ${hangKillTimeoutMs}ms hang.`);
                         }
@@ -716,8 +788,13 @@ class WptRunner extends WebNNRunner {
     }
 
         // Final cleanup: make sure no chrome/msedge processes from this run
-        // are left behind when runWptTests returns.
+        // are left behind when runWptTests returns. NOTE: the caller
+        // (main.js) is responsible for the blanket kill-all sweep after we
+        // return — doing it here would race with Playwright's own async
+        // close on the persistent context main.js still holds.
         try { killOwnBrowserProcesses(null); } catch(e) {}
+        // Force-remove the user-data directory at the end of the WPT run.
+        try { removeOwnUserDataDir({ quiet: true }); } catch(e) {}
 
         return results;
   }
@@ -865,9 +942,15 @@ class WptRunner extends WebNNRunner {
             else if (body.includes('PASS')) { subcases.total=1; subcases.passed=1; resultStatus = 'PASS'; }
             else if (body.includes('FAIL')) { subcases.total=1; subcases.failed=1; resultStatus = 'FAIL'; }
 
-            // Scrape detailed failure info if requested and there are failures
+            // Scrape detailed subtest info if requested. We collect EVERY row
+            // (PASS/FAIL/TIMEOUT/ERROR/NOTRUN/...) into `allSubtests` so the
+            // TXT / CSV reports can show a per-subtest breakdown that
+            // includes passing subtests, not only failures. `failedSubtests`
+            // is retained (a filtered view) so downstream HTML / regression
+            // comparison code that already reads it keeps working.
+            let allSubtests = [];
             let failedSubtests = [];
-            if (scrapeDetails && subcases.failed > 0) {
+            if (scrapeDetails && (subcases.total > 0 || subcases.passed > 0 || subcases.failed > 0)) {
                 // WPT results structure: #results IS the table element (contains thead/tbody directly)
                 // Don't use '#results table' as that matches nested empty tables in <details>
                 const resultsTable = document.querySelector('#results');
@@ -888,32 +971,36 @@ class WptRunner extends WebNNRunner {
                             const messageCell = cells[2];
 
                             const status = statusCell ? statusCell.textContent.trim().toUpperCase() : '';
+                            if (!status) return;
 
+                            // Test name is in the second column
+                            const testName = nameCell ? nameCell.textContent.trim().split('\n')[0].substring(0, 300) : 'Unknown';
+
+                            // Message column: only meaningful for non-PASS. Skip
+                            // scraping for PASS to keep the payload small.
+                            let message = '';
+                            if (status !== 'PASS' && messageCell) {
+                                const clone = messageCell.cloneNode(true);
+                                const details = clone.querySelector('details');
+                                if (details) details.remove();
+                                message = clone.textContent.trim().substring(0, 800);
+                            }
+
+                            const entry = {
+                                name: testName || 'Unknown subtest',
+                                status: status,
+                                message: message
+                            };
+                            allSubtests.push(entry);
                             if (status === 'FAIL' || status === 'TIMEOUT' || status === 'ERROR' || status === 'NOTRUN') {
-                                // Test name is in the second column
-                                const testName = nameCell ? nameCell.textContent.trim().split('\n')[0].substring(0, 300) : 'Unknown';
-
-                                // Message is in the third column
-                                let message = '';
-                                if (messageCell) {
-                                    const clone = messageCell.cloneNode(true);
-                                    const details = clone.querySelector('details');
-                                    if (details) details.remove();
-                                    message = clone.textContent.trim().substring(0, 800);
-                                }
-
-                                failedSubtests.push({
-                                    name: testName || 'Unknown subtest',
-                                    status: status,
-                                    message: message
-                                });
+                                failedSubtests.push(entry);
                             }
                         }
                     });
                 }
             }
 
-            return { result: resultStatus, subcases, failedSubtests };
+            return { result: resultStatus, subcases, failedSubtests, allSubtests };
         }, scrapeDetails);
     } catch (e) {
         return null;
@@ -991,15 +1078,24 @@ class WptRunner extends WebNNRunner {
 
         const resData = await this.parseWptPageResults(page, verboseEnabled);
 
-        // If verbose mode is enabled and there are failures but no details captured, try scraping separately
+        // If verbose mode is enabled and the details scrape came back empty,
+        // try a second pass. Previously this only ran when there were
+        // failures; now we also retry when there are only PASSes so the
+        // per-subcase PASS list is captured for the reports.
         let failedSubtests = resData.failedSubtests || [];
-        if (verboseEnabled && resData.subcases.failed > 0 && failedSubtests.length === 0) {
+        let allSubtests = resData.allSubtests || [];
+        const needsFallbackScrape = verboseEnabled && (
+            (resData.subcases.failed > 0 && failedSubtests.length === 0) ||
+            (resData.subcases.total > 0 && allSubtests.length === 0)
+        );
+        if (needsFallbackScrape) {
             // Wait a bit more for the table to populate
             await page.waitForTimeout(1000);
 
             try {
-                failedSubtests = await page.evaluate(() => {
-                    const failures = [];
+                const scraped = await page.evaluate(() => {
+                    const all = [];
+                    const failed = [];
 
                     // #results IS the table element (contains thead/tbody directly)
                     // Don't look for a nested table - that matches the empty table in <details>
@@ -1022,39 +1118,47 @@ class WptRunner extends WebNNRunner {
                                 const messageCell = cells[2];
 
                                 const status = statusCell ? statusCell.textContent.trim().toUpperCase() : '';
+                                if (!status) return;
 
+                                // Test name is in the second column
+                                const testName = nameCell ? nameCell.textContent.trim().split('\n')[0].substring(0, 300) : 'Unknown';
+
+                                // Message column: skip for PASS to keep payload small.
+                                let message = '';
+                                if (status !== 'PASS' && messageCell) {
+                                    const clone = messageCell.cloneNode(true);
+                                    const details = clone.querySelector('details');
+                                    if (details) details.remove();
+                                    message = clone.textContent.trim().substring(0, 800);
+                                }
+
+                                const entry = {
+                                    name: testName,
+                                    status: status,
+                                    message: message
+                                };
+                                all.push(entry);
                                 if (status === 'FAIL' || status === 'TIMEOUT' || status === 'ERROR' || status === 'NOTRUN') {
-                                    // Test name is in the second column
-                                    const testName = nameCell ? nameCell.textContent.trim().split('\n')[0].substring(0, 300) : 'Unknown';
-
-                                    // Message is in the third column, often starts with assertion text
-                                    let message = '';
-                                    if (messageCell) {
-                                        // Get text before <details> and clean it up
-                                        const clone = messageCell.cloneNode(true);
-                                        const details = clone.querySelector('details');
-                                        if (details) details.remove();
-                                        message = clone.textContent.trim().substring(0, 800);
-                                    }
-
-                                    failures.push({
-                                        name: testName,
-                                        status: status,
-                                        message: message
-                                    });
+                                    failed.push(entry);
                                 }
                             }
                         });
                     }
-                    return failures;
+                    return { all, failed };
                 });
+                if (scraped) {
+                    if (scraped.all && scraped.all.length > 0) allSubtests = scraped.all;
+                    if (scraped.failed && scraped.failed.length > 0) failedSubtests = scraped.failed;
+                }
             } catch (e) {
                 // Scraping failed, continue without details
             }
         }
 
-        // Log captured failures
-        if (failedSubtests && failedSubtests.length > 0) {
+        // Log captured subtests
+        if (allSubtests && allSubtests.length > 0) {
+            console.log(`[${testName}] Captured ${allSubtests.length} subtest(s) details (${failedSubtests.length} failed)`);
+        } else if (failedSubtests && failedSubtests.length > 0) {
             console.log(`[${testName}] Captured ${failedSubtests.length} failed subtest(s) details`);
         }
 
@@ -1067,6 +1171,7 @@ class WptRunner extends WebNNRunner {
             result: resData.result,
             subcases: resData.subcases,
             failedSubtests: failedSubtests && failedSubtests.length > 0 ? failedSubtests : undefined,
+            allSubtests: allSubtests && allSubtests.length > 0 ? allSubtests : undefined,
             executionTime: '0.00'
         };
     };
@@ -1075,13 +1180,19 @@ class WptRunner extends WebNNRunner {
         // Enforce a global per-case timeout (configurable via WPT_CASE_TIMEOUT_MS,
         // default 180000ms). The error message includes the configured value so
         // the chunkedExec catch (and retry logic) can identify it as a TIMEOUT.
+        //
+        // IMPORTANT: capture the timer id and clear it in .finally() so a fast
+        // test doesn't leak a ~180s timer that keeps Node's event loop alive.
+        let caseTimeoutId;
         return await Promise.race([
             runTest(),
-            new Promise((_, reject) => setTimeout(
-                () => reject(new Error(`Timeout ${caseTimeoutMs}ms exceeded`)),
-                caseTimeoutMs
-            ))
-        ]);
+            new Promise((_, reject) => {
+                caseTimeoutId = setTimeout(
+                    () => reject(new Error(`Timeout ${caseTimeoutMs}ms exceeded`)),
+                    caseTimeoutMs
+                );
+            })
+        ]).finally(() => clearTimeout(caseTimeoutId));
     } catch (e) {
         // Rethrow critical errors to trigger browser restart in chunkedExec
         if (e.message.includes('Timeout') ||

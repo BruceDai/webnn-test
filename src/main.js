@@ -8,7 +8,7 @@ const { test, expect, chromium } = require('@playwright/test');
 
 const { WptRunner } = require('./wpt');
 const { ModelRunner } = require('./model');
-const { launchBrowser, killOwnBrowserProcesses, findBrowserRootPid, get_gpu_info, get_cpu_info, get_npu_info } = require('./util');
+const { launchBrowser, killOwnBrowserProcesses, killAllBrowserProcesses, sweepZombieBrowserProcesses, findBrowserRootPid, get_gpu_info, get_cpu_info, get_npu_info } = require('./util');
 const { getRuntimeInfo, runtimeInfoRows, resolveWindowsAppSdk, verifyWindowsAppSdk } = require('./runtime-info');
 
 // Helper to parse comma-separated lists
@@ -16,6 +16,14 @@ const parseList = (str) => (str || '').split(',').map(s => s.trim()).filter(s =>
 
 // Helper to identify framework and backend
 const getFramework = (browserArgs) => (browserArgs || '').includes('WebNNLiteRT') ? 'litert' : 'ort';
+
+// Resolve the browser process image name (chrome.exe vs msedge.exe) from the
+// current environment. Used by parent and child sides for targeted kills.
+const resolveBrowserProcessName = () => {
+    const bPath = (process.env.BROWSER_PATH || '').toLowerCase();
+    return (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge')) ? 'msedge.exe' : 'chrome.exe';
+};
+
 const getBackend = (framework, browserArgs, dllResults, device) => {
     // If device is cpu, backend has to be cpu
     if (device === 'cpu') return 'cpu';
@@ -255,10 +263,21 @@ Examples:
   delete process.env.EXTRA_BROWSER_ARGS;
 
   // --- Execution & Iteration Loop ---
+  // If this run includes any WPT config, kill existing browser processes
+  // up-front so no user/zombie Chrome/Edge interferes with the automation launch.
+  const hasWptConfig = runConfigs.some(c => c.suite === 'wpt');
+  // Note: playwrightChannel is only ever chrome-*, so process name is derived
+  // from --browser-path when Edge is in use.
+  const wptProcessName = ((browserPath || '').toLowerCase().includes('msedge')) ? 'msedge.exe' : 'chrome.exe';
 
   const runIteration = (iteration, totalIterations) => {
       return new Promise((resolve, reject) => {
           const iterationPrefix = totalIterations > 1 ? `[Iteration ${iteration}/${totalIterations}] ` : '';
+
+          if (hasWptConfig) {
+              console.log(`[Info] Pre-WPT sweep (parent): killing ${wptProcessName} processes for a clean slate...`);
+              try { killAllBrowserProcesses({ processNames: [wptProcessName] }); } catch (_) { /* best effort */ }
+          }
 
           if (totalIterations > 1) {
             console.log(`\n${'='.repeat(80)}`);
@@ -307,6 +326,21 @@ Examples:
           });
 
           childProcess.on('close', (code) => {
+              // Chrome GPU-process crashes during a WPT run can leave zombie
+              // chrome.exe entries (HasExited=True but PID still enumerable)
+              // because a third-party process (EDR / WerSvc / crashpad) holds
+              // an open handle. Best-effort sweep after each iteration; safe
+              // no-op when handle.exe is not installed.
+              try { sweepZombieBrowserProcesses({ quiet: true }); } catch (_) {}
+
+              // Post-WPT force-kill on the parent side: guarantee no browser
+              // process survives after each WPT iteration, even if the child's
+              // own post-suite sweep missed anything.
+              if (hasWptConfig) {
+                  console.log(`[Info] Post-WPT sweep (parent): force-killing ${wptProcessName} processes...`);
+                  try { killAllBrowserProcesses({ processNames: [wptProcessName] }); } catch (_) { /* best effort */ }
+              }
+
               if (code === 0) {
                   console.log(`[Success] Results saved to: ${runDir}`);
                   resolve(0);
@@ -355,7 +389,10 @@ Examples:
           // Call unconditionally: killOwnBrowserProcesses also sweeps any leftover
           // chrome/msedge processes launched with our user-data-dir, so it works
           // even when browserRootPid could not be captured.
-          killOwnBrowserProcesses(browserRootPid);
+          // sweepZombies:true attempts to reap chrome.exe PIDs that terminated
+          // but linger because a third-party process still holds a handle
+          // (uses Sysinternals handle.exe when installed; no-op otherwise).
+          killOwnBrowserProcesses(browserRootPid, { sweepZombies: true });
       });
 
       if (process.env.IS_LIST_MODE === 'true') {
@@ -426,9 +463,36 @@ Examples:
                    process.env.EXTRA_BROWSER_ARGS = config.browserArgs || '';
                    process.env.DEVICE = config.device;
 
-                   // Always relaunch for isolation between configs
-                   if (browser) {
-                       await browser.close();
+                   const isWpt = (config.suite === 'wpt');
+
+                   // For WPT configs we want a guaranteed clean slate: kill
+                   // every chrome/msedge process on the machine BEFORE the
+                   // launch so no zombie / user-owned browser interferes.
+                   // Skip the graceful `browser.close()` here � we're about
+                   // to blanket-kill anyway, and awaiting Playwright's close
+                   // while we kill the same PIDs from the OS side causes
+                   // long graceful-close timeouts and races Playwright's
+                   // async temp-dir cleanup against our next launch on the
+                   // same user-data-dir (Playwright logs
+                   // "process did exit: exitCode=21" then "will force kill"
+                   // for a PID we already reaped).
+                   if (isWpt) {
+                       if (browser) {
+                           // Drop the reference without awaiting close � the
+                           // kill below will terminate the underlying
+                           // processes and Playwright will settle its own
+                           // internal promises on the dead connection.
+                           browser = null;
+                       }
+                       const pName = resolveBrowserProcessName();
+                       console.log(`[Info] Pre-WPT sweep: killing ${pName} processes for a clean slate...`);
+                       try { killAllBrowserProcesses({ processNames: [pName] }); } catch (_) { /* best effort */ }
+                       // Give the OS time to release the user-data-dir lock
+                       // and let Playwright's background cleanup drain.
+                       await new Promise(r => setTimeout(r, 3000));
+                   } else if (browser) {
+                       // Non-WPT config: preserve the previous graceful path.
+                       try { await browser.close(); } catch (e) { /* already gone */ }
                        browser = null;
                        await new Promise(r => setTimeout(r, 1000));
                    }
@@ -511,6 +575,21 @@ Examples:
                        runRes = await currentRunner.runWptTests(context, browser, onFirstCaseComplete);
                    } else {
                        runRes = await currentRunner.runModelTests(onFirstCaseComplete);
+                   }
+
+                   // Post-WPT sweep: blanket-kill ALL chrome.exe / msedge.exe
+                   // so the next config (or the afterAll hook) starts from a
+                   // clean slate with zero zombie browser processes. Drop the
+                   // stale reference first so main.js's next-iteration
+                   // close/afterAll won't try to talk to a dead browser.
+                   if (isWpt) {
+                       browser = null;
+                       context = null;
+                       page = null;
+                       const pName = resolveBrowserProcessName();
+                       console.log(`[Info] Post-WPT sweep: killing ${pName} processes...`);
+                       try { killAllBrowserProcesses({ processNames: [pName] }); } catch (_) { /* best effort */ }
+                       await new Promise(r => setTimeout(r, 3000));
                    }
 
                    // Ensure check ran if for some reason callback wasn't triggered (e.g. 0 tests)
@@ -791,9 +870,15 @@ Examples:
                                if (r.perfSummary) {
                                    line += `\n  perf: ${r.perfSummary}`;
                                }
-                               // Append detailed failure messages for WPT if available
-                               if (r.failedSubtests && r.failedSubtests.length > 0) {
-                                   const subtestDetails = r.failedSubtests.map(s => `  - ${s.name}: ${s.status}`).join('\n');
+                               // Per-subtest breakdown. Prefer the full subtest list
+                               // (includes PASS rows) so passing subtests show up too.
+                               // Fall back to the failure-only list when the full list
+                               // wasn't captured (e.g. partial scrape after timeout).
+                               const detailList = Array.isArray(r.allSubtests) && r.allSubtests.length > 0
+                                   ? r.allSubtests
+                                   : (Array.isArray(r.failedSubtests) && r.failedSubtests.length > 0 ? r.failedSubtests : null);
+                               if (detailList) {
+                                   const subtestDetails = detailList.map(s => `  - ${s.name}: ${s.status}`).join('\n');
                                    line += `\n${subtestDetails}`;
                                }
                                return line;
