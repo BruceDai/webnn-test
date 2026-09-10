@@ -18,6 +18,62 @@ const OWN_USER_DATA_DIR = path.resolve(path.join(__dirname, '..', 'user-data'));
 
 function getOwnUserDataDir() { return OWN_USER_DATA_DIR; }
 
+// Force-delete our user-data directory. Used at WPT test boundaries so every
+// test case starts from a truly clean profile — no cached compiled shaders, no
+// leftover cookies/service-workers, no lingering IndexedDB, no crash-restore
+// tabs, and no stale user-data-dir lock file left behind by a hung Playwright
+// close(). Callers MUST first kill any browser processes still holding files
+// in the directory (see killOwnBrowserProcesses / killAllBrowserProcesses),
+// otherwise Windows will refuse to unlink open files.
+//
+// Behavior:
+//   * Retries a few times because on Windows a just-exited Chrome may still
+//     hold handles (crashpad_handler / AV scans) for a brief moment.
+//   * Never throws. Silent no-op when the directory does not exist.
+//   * Returns true iff the directory is absent when the call returns.
+function removeOwnUserDataDir({ maxAttempts = 5, delayMs = 300, quiet = false } = {}) {
+    if (!fs.existsSync(OWN_USER_DATA_DIR)) return true;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            fs.rmSync(OWN_USER_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+            if (!fs.existsSync(OWN_USER_DATA_DIR)) {
+                if (!quiet) console.log(`[UserData] Removed user-data dir: ${OWN_USER_DATA_DIR}`);
+                return true;
+            }
+        } catch (e) {
+            lastErr = e;
+        }
+        // Escalate: on Windows, `rmdir /S /Q` + a short PowerShell fallback
+        // often succeeds where fs.rmSync loses to lingering file handles.
+        try {
+            execSync(`cmd /c rmdir /S /Q "${OWN_USER_DATA_DIR}"`, { stdio: 'ignore', timeout: 10000, windowsHide: true });
+        } catch (_) { /* fall through */ }
+        if (!fs.existsSync(OWN_USER_DATA_DIR)) {
+            if (!quiet) console.log(`[UserData] Removed user-data dir via rmdir: ${OWN_USER_DATA_DIR}`);
+            return true;
+        }
+        try {
+            execSync(
+                `powershell -NoProfile -ExecutionPolicy Bypass -Command ` +
+                `"$ErrorActionPreference='SilentlyContinue';` +
+                `Remove-Item -LiteralPath '${OWN_USER_DATA_DIR.replace(/'/g, "''")}' -Recurse -Force -ErrorAction SilentlyContinue"`,
+                { stdio: 'ignore', timeout: 15000, windowsHide: true }
+            );
+        } catch (_) { /* fall through */ }
+        if (!fs.existsSync(OWN_USER_DATA_DIR)) {
+            if (!quiet) console.log(`[UserData] Removed user-data dir via PowerShell: ${OWN_USER_DATA_DIR}`);
+            return true;
+        }
+        // Brief wait for the OS to release handles between attempts.
+        try { execSync(`powershell -NoProfile -Command "Start-Sleep -Milliseconds ${delayMs * attempt}"`, { stdio: 'ignore', timeout: (delayMs * attempt) + 2000, windowsHide: true }); } catch (_) {}
+    }
+    if (!quiet) {
+        console.error(`[UserData] Failed to remove user-data dir after ${maxAttempts} attempts: ${OWN_USER_DATA_DIR}${lastErr ? ` (last error: ${lastErr.message})` : ''}`);
+    }
+    return !fs.existsSync(OWN_USER_DATA_DIR);
+}
+
 // Return all PIDs of chrome/msedge processes whose CommandLine references our
 // user-data-dir (i.e. processes we launched). Includes the root process AND
 // any child renderer/GPU/utility processes Chrome inherits the flag on.
@@ -45,6 +101,36 @@ function findOwnBrowserPids(processName = null) {
     }
 }
 
+// Path to the standalone PowerShell zombie-cleanup script.
+const CLEANUP_PS1 = path.resolve(path.join(__dirname, '..', 'tools', 'Powershell', 'Clear-ZombieChromeProcesses.ps1'));
+
+// Sweep zombie chrome/msedge PIDs (HasExited=True but PID still enumerable).
+// Uses tools/Powershell/Clear-ZombieChromeProcesses.ps1, which opportunistically
+// invokes Sysinternals handle.exe when installed. Safe no-op when the script or
+// handle.exe is missing. Best-effort: never throws.
+function sweepZombieBrowserProcesses({ all = false, quiet = true } = {}) {
+    if (!fs.existsSync(CLEANUP_PS1)) return { ok: false, reason: 'cleanup-script-missing' };
+    const args = [
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', CLEANUP_PS1,
+        '-UserDataDir', OWN_USER_DATA_DIR
+    ];
+    if (all) args.push('-All');
+    if (quiet) args.push('-Quiet');
+    try {
+        execSync(`powershell ${args.map(a => /\s/.test(a) ? `"${a}"` : a).join(' ')}`, {
+            stdio: quiet ? 'ignore' : 'inherit',
+            timeout: 30000,
+            windowsHide: true,
+        });
+        return { ok: true };
+    } catch (e) {
+        // Non-zero exit codes from the script are informational (2..5 map to
+        // "zombies remain / handle.exe missing"); we don't fail the run for them.
+        return { ok: false, reason: e && e.message || String(e) };
+    }
+}
+
 // Kill only browser processes that belong to our automation.
 // Strategy:
 //   1. If we have a tracked root PID, kill its whole tree with taskkill /T.
@@ -52,7 +138,15 @@ function findOwnBrowserPids(processName = null) {
 //      line contains our unique user-data-dir. This catches orphan renderer /
 //      GPU / utility processes that Playwright's close() sometimes leaves
 //      behind, without touching the user's personal browser.
-function killOwnBrowserProcesses(browserRootPid) {
+//   3. Best-effort zombie sweep for PIDs that terminated but linger because a
+//      third-party process (EDR / WerSvc / crashpad) still holds a handle to
+//      them. Uses Sysinternals handle.exe when available; no-op otherwise.
+//   4. Verification loop: after the initial sweep, re-scan for survivors and
+//      escalate to PowerShell Stop-Process -Force. This is critical on crash
+//      paths where crashpad_handler / GPU child processes routinely linger
+//      past a plain `taskkill /F /T`, which would otherwise cause the next
+//      launchPersistentContext() call to fail on the user-data-dir lock.
+function killOwnBrowserProcesses(browserRootPid, { sweepZombies = false, verify = true, maxVerifyAttempts = 3 } = {}) {
     let killed = 0;
 
     if (browserRootPid) {
@@ -80,7 +174,118 @@ function killOwnBrowserProcesses(browserRootPid) {
         console.log('[Info] No leftover browser processes found for own user-data-dir');
     }
 
+    // Verification loop: taskkill can fail silently (protected handles,
+    // AV/EDR races, crashpad_handler.exe holding onto crashed renderers).
+    // Re-scan a few times; on each retry, escalate to Stop-Process -Force,
+    // which is the strongest Windows user-mode kill.
+    if (verify) {
+        for (let attempt = 1; attempt <= maxVerifyAttempts; attempt++) {
+            // Give the OS ~250ms for handles to drain between attempts.
+            const waitMs = 250 * attempt;
+            const survivors = findOwnBrowserPids();
+            if (survivors.length === 0) {
+                if (attempt > 1) {
+                    console.log(`[Info] All automation-owned browser processes confirmed gone after ${attempt} verify pass(es)`);
+                }
+                break;
+            }
+            console.log(`[Warning] ${survivors.length} browser process(es) still alive after kill (attempt ${attempt}/${maxVerifyAttempts}): PIDs ${survivors.join(', ')}. Escalating...`);
+
+            // Escalation 1: individual taskkill again with /T.
+            for (const pid of survivors) {
+                try { execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore', timeout: 5000 }); } catch (_) {}
+            }
+
+            // Escalation 2: PowerShell Stop-Process -Force by PID list.
+            // -Force ignores confirmation; -ErrorAction SilentlyContinue swallows
+            // "process already exited" races.
+            try {
+                const pidList = survivors.join(',');
+                execSync(
+                    `powershell -NoProfile -ExecutionPolicy Bypass -Command ` +
+                    `"$ErrorActionPreference='SilentlyContinue';` +
+                    `Get-Process -Id ${pidList} -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"`,
+                    { stdio: 'ignore', timeout: 10000, windowsHide: true }
+                );
+            } catch (_) {}
+
+            // Brief wait for OS to reap handles before re-checking.
+            try { execSync(`powershell -NoProfile -Command "Start-Sleep -Milliseconds ${waitMs}"`, { stdio: 'ignore', timeout: waitMs + 2000, windowsHide: true }); } catch (_) {}
+        }
+
+        const finalCheck = findOwnBrowserPids();
+        if (finalCheck.length > 0) {
+            console.error(`[Error] ${finalCheck.length} browser process(es) still alive after all kill attempts: PIDs ${finalCheck.join(', ')}. May cause user-data-dir lock on next launch.`);
+        }
+    }
+
+    // Zombie sweep only on request (typically end-of-run OR crash recovery).
+    // Uses Sysinternals handle.exe when available to close third-party handles
+    // that keep already-exited PIDs enumerable. Cheap no-op when nothing to reap.
+    if (sweepZombies) {
+        sweepZombieBrowserProcesses({ quiet: true });
+    }
+
     return killed;
+}
+
+// Blanket-kill EVERY chrome.exe / msedge.exe process on the machine.
+//
+// WARNING: this is a bigger hammer than `killOwnBrowserProcesses`. It closes
+// the user's personal Chrome/Edge windows too. It exists so WPT runs can
+// guarantee a clean slate with zero zombie browser processes hanging around
+// from prior runs (or from unrelated tools) before/after the suite executes.
+//
+// Only call this at WPT suite boundaries where destroying every browser on
+// the machine is acceptable (test rigs / CI / dedicated test workstations).
+// Do NOT call this inside per-test hot paths.
+function killAllBrowserProcesses({ processNames = ['chrome.exe', 'msedge.exe'], quiet = false } = {}) {
+    let killedAny = 0;
+    for (const name of processNames) {
+        try {
+            // /F force, /T tree, /IM image name.
+            // taskkill exits non-zero when no matching process is found; ignore.
+            execSync(`taskkill /F /T /IM ${name}`, { stdio: 'ignore', timeout: 15000 });
+            if (!quiet) console.log(`[Info] Killed all ${name} processes`);
+            killedAny++;
+        } catch (e) {
+            // No matching process, or already-dead — non-fatal.
+        }
+
+        // Only run the PowerShell force-kill fallback if survivors exist.
+        // tasklist exits 0 with a header line when matches are found, and 0
+        // with an "INFO: No tasks are running" line when nothing matches.
+        let hasSurvivors = false;
+        try {
+            const out = execSync(
+                `tasklist /FI "IMAGENAME eq ${name}" /NH /FO CSV`,
+                { encoding: 'utf8', timeout: 5000, windowsHide: true }
+            );
+            hasSurvivors = /^"/m.test(out);
+        } catch (_) { /* treat as no survivors */ }
+
+        if (hasSurvivors) {
+            // Fallback force-kill via PowerShell for anything taskkill couldn't
+            // terminate (e.g. protected handles / racing child procs).
+            // Stop-Process -Force is the strongest Windows user-mode kill.
+            const baseName = name.replace(/\.exe$/i, '');
+            try {
+                execSync(
+                    `powershell -NoProfile -ExecutionPolicy Bypass -Command ` +
+                    `"$ErrorActionPreference='SilentlyContinue';` +
+                    `Get-Process -Name '${baseName}' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"`,
+                    { stdio: 'ignore', timeout: 15000, windowsHide: true }
+                );
+                if (!quiet) console.log(`[Info] Force-killed leftover ${name} processes via Stop-Process`);
+            } catch (e) {
+                // Non-fatal.
+            }
+        }
+    }
+    // Also reap zombies (PIDs whose process exited but a third-party handle keeps
+    // them enumerable). Cheap when there is nothing to reap.
+    try { sweepZombieBrowserProcesses({ all: true, quiet: true }); } catch (_) {}
+    return killedAny;
 }
 
 // -------------------------------------------------------------------------
@@ -113,10 +318,17 @@ function armHangKillWatchdog(timeoutMs, label = 'operation', browserRootPid = nu
         fired = true;
         console.error(`[HangKill] ${label} exceeded ${timeoutMs}ms without completing. Force-killing browser processes to unblock.`);
         try {
-            killOwnBrowserProcesses(browserRootPid);
+            // Crash paths: enable zombie sweep. Hung IPC often coincides with
+            // crashpad_handler holding onto exited renderer/GPU PIDs.
+            killOwnBrowserProcesses(browserRootPid, { sweepZombies: true });
         } catch (e) {
             console.error(`[HangKill] killOwnBrowserProcesses failed: ${e && e.message || e}`);
         }
+        // Crash/hang path: also wipe the user-data directory. A crash can
+        // leave the profile in a corrupt state (bad Preferences/Local State,
+        // stale SingletonLock, half-written LevelDB), which then breaks the
+        // next launchPersistentContext(). Must come AFTER the process kill.
+        try { removeOwnUserDataDir({ quiet: true }); } catch (_) {}
     }, timeoutMs);
     return {
         disarm() { clearTimeout(timer); },
@@ -131,7 +343,10 @@ async function withHangKill(operation, timeoutMs, label = 'operation', browserRo
         timer = setTimeout(() => {
             killed = true;
             console.error(`[HangKill] ${label} exceeded ${timeoutMs}ms. Force-killing browser processes...`);
-            try { killOwnBrowserProcesses(browserRootPid); } catch (_) {}
+            try { killOwnBrowserProcesses(browserRootPid, { sweepZombies: true }); } catch (_) {}
+            // Crash/hang path: also wipe the user-data directory (see
+            // armHangKillWatchdog for rationale). Must come AFTER the kill.
+            try { removeOwnUserDataDir({ quiet: true }); } catch (_) {}
             const err = new Error(`${label} timed out after ${timeoutMs}ms (browser force-killed)`);
             err.name = 'HangKillTimeoutError';
             reject(err);
@@ -462,6 +677,13 @@ async function launchBrowser() {
    // We use a local persistent directory in the workspace. Must match
    // OWN_USER_DATA_DIR so our process-identification logic can find it.
    const userDataDir = OWN_USER_DATA_DIR;
+   // Force-clean the user-data dir before every launch. This runs AFTER the
+   // stale-process kill above so no browser is holding any of these files.
+   // Guarantees each WPT test starts from a pristine profile (no cached
+   // compiled shaders, no restore tabs, no leftover lock file).
+   try { removeOwnUserDataDir({ quiet: false }); } catch (e) {
+       console.log(`[Warning] Failed to force-clean user-data dir before launch: ${e && e.message || e}`);
+   }
    if (!fs.existsSync(userDataDir)) {
        fs.mkdirSync(userDataDir, { recursive: true });
    }
@@ -579,7 +801,15 @@ class WebNNRunner {
       hardTimer = setTimeout(() => {
         hardTimedOut = true;
         console.error(`[HangKill] runTestWithSessionCheck exceeded ${timeoutMs}ms. Force-killing browser processes...`);
-        try { killOwnBrowserProcesses(this.browserRootPid); } catch (_) {}
+        // Crash path: enable zombie sweep. GPU-process crash typically leaves
+        // renderer PIDs held by crashpad_handler; a plain taskkill sweep won't
+        // reap them and the next launch will collide on the user-data-dir lock.
+        try { killOwnBrowserProcesses(this.browserRootPid, { sweepZombies: true }); } catch (_) {}
+        // Crash path: wipe the user-data directory too. A GPU-process crash
+        // often corrupts the profile (bad Local State / SingletonLock),
+        // which breaks the next launchPersistentContext(). Must come AFTER
+        // the process kill so no browser is holding these files.
+        try { removeOwnUserDataDir({ quiet: true }); } catch (_) {}
         reject(new Error(`Test hard timeout (${timeoutMs/1000}s) - GPU process may have crashed`));
       }, timeoutMs);
     });
@@ -665,13 +895,18 @@ class WebNNRunner {
       const closeTimeoutMs = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS, 10) || 15000;
       try {
         console.log(`[Info] Closing browser before restart (timeout ${closeTimeoutMs}ms)...`);
+        // Capture the timer id and clear it after the race resolves, or the
+        // timer leaks and keeps Node's event loop alive for `closeTimeoutMs`.
+        let closeTimeoutId;
         await Promise.race([
           browserToClose.close().then(() => { console.log('[Success] Browser closed'); }),
-          new Promise((_, reject) => setTimeout(
-              () => reject(new Error(`browser.close() timed out after ${closeTimeoutMs}ms`)),
-              closeTimeoutMs
-          ))
-        ]);
+          new Promise((_, reject) => {
+            closeTimeoutId = setTimeout(
+                () => reject(new Error(`browser.close() timed out after ${closeTimeoutMs}ms`)),
+                closeTimeoutMs
+            );
+          })
+        ]).finally(() => clearTimeout(closeTimeoutId));
       } catch (e) {
         console.log(`[Warning] Error / timeout closing browser: ${e.message}. Will force-kill.`);
       }
@@ -689,11 +924,40 @@ class WebNNRunner {
     } else {
         console.log('[Info] Sweeping leftover browser processes matching own user-data-dir...');
     }
-    killOwnBrowserProcesses(this.browserRootPid);
+    // Crash / hang recovery: enable zombie sweep so we don't leave PIDs held
+    // by crashpad_handler. killOwnBrowserProcesses already does its own
+    // verify+retry loop; the 3s wait below is belt-and-braces for the OS to
+    // release the user-data-dir lock before we relaunch.
+    killOwnBrowserProcesses(this.browserRootPid, { sweepZombies: true });
     this.browserRootPid = null;
+
+    // Force-remove the user-data directory before relaunch. A crash can
+    // leave the profile in a corrupt state (bad Preferences / Local State,
+    // stale SingletonLock, half-written LevelDB) that breaks the next
+    // launchPersistentContext(). launchBrowser() also wipes it, but doing
+    // it here surfaces failures immediately in the restart log.
+    try { removeOwnUserDataDir({ quiet: true }); } catch (_) {}
 
     // Wait a bit to ensure process is fully gone
     await new Promise(resolve => setTimeout(resolve, 3000));
+
+    // Final safety check: if any of our browser PIDs somehow survived the
+    // verify loop AND the 3s grace, log loudly. Relaunch may still succeed
+    // (Playwright will just error and we surface it), but this makes the
+    // failure mode diagnosable in the logs instead of silent.
+    const stragglers = findOwnBrowserPids();
+    if (stragglers.length > 0) {
+        console.error(`[Error] ${stragglers.length} browser PID(s) still alive before relaunch: ${stragglers.join(', ')}. Attempting one more Stop-Process -Force pass...`);
+        try {
+            execSync(
+                `powershell -NoProfile -ExecutionPolicy Bypass -Command ` +
+                `"$ErrorActionPreference='SilentlyContinue';` +
+                `Get-Process -Id ${stragglers.join(',')} -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue"`,
+                { stdio: 'ignore', timeout: 10000, windowsHide: true }
+            );
+        } catch (_) {}
+        await new Promise(resolve => setTimeout(resolve, 1500));
+    }
 
     if (!this.launchNewBrowser) {
       throw new Error('launchNewBrowser function is not defined');
@@ -2120,4 +2384,4 @@ class WebNNPerfCollector {
   }
 }
 
-module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, armHangKillWatchdog, withHangKill, findBrowserRootPid, findOwnBrowserPids, getOwnUserDataDir, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };
+module.exports = { WebNNRunner, WebNNPerfCollector, killOwnBrowserProcesses, killAllBrowserProcesses, sweepZombieBrowserProcesses, armHangKillWatchdog, withHangKill, findBrowserRootPid, findOwnBrowserPids, getOwnUserDataDir, removeOwnUserDataDir, launchBrowser, get_gpu_info, get_cpu_info, get_npu_info };
