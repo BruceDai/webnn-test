@@ -2,7 +2,36 @@
 const { test } = require('@playwright/test');
 const fs = require('fs');
 const path = require('path');
-const { WebNNRunner, killOwnBrowserProcesses, armHangKillWatchdog, withHangKill, removeOwnUserDataDir } = require('./util');
+const { WebNNRunner, killOwnBrowserProcesses, killAllBrowserProcesses, armHangKillWatchdog, withHangKill, removeOwnUserDataDir } = require('./util');
+
+// Resolve the browser image name (chrome.exe vs msedge.exe) the same way
+// main.js does, so the blanket sweep targets the browser we actually drive.
+const resolveBrowserProcessName = () => {
+    const bPath = (process.env.BROWSER_PATH || '').toLowerCase();
+    return (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge')) ? 'msedge.exe' : 'chrome.exe';
+};
+
+// Blanket force-kill EVERY chrome/msedge process after each WPT iteration
+// (test case and retry attempt). `killOwnBrowserProcesses` only reaps
+// processes whose command line carries our user-data-dir, so it misses
+// browsers that lost that marker (post-crash relaunches, crashpad children,
+// orphans left by an earlier run). Those survivors hold the profile lock and
+// GPU/NPU resources, which makes the *next* test launch fail or hang.
+//
+// This is a big hammer — it also closes a human user's browser windows — and
+// it assumes a single browser at a time (the run already restarts the browser
+// per test, so JOBS > 1 is not isolated anyway). Set WPT_KILL_ALL_BROWSERS=false
+// to fall back to the user-data-dir-scoped sweep only.
+function forceKillAllBrowsers(label) {
+    if (process.env.WPT_KILL_ALL_BROWSERS === 'false') return;
+    const pName = resolveBrowserProcessName();
+    try {
+        killAllBrowserProcesses({ processNames: [pName], quiet: true });
+        console.log(`[Info] Force-killed all ${pName} processes after ${label}.`);
+    } catch (e) {
+        console.log(`[Warning] Blanket ${pName} kill after ${label} failed: ${e && e.message || e}`);
+    }
+}
 
 class WptRunner extends WebNNRunner {
     writeFinalResultsCsv(results) {
@@ -445,6 +474,9 @@ class WptRunner extends WebNNRunner {
                              this.page = null;
                          } catch (_) {}
                          try { killOwnBrowserProcesses(null); } catch(e) {}
+                         // Then blanket force-kill every chrome/msedge on the
+                         // machine so this iteration leaves nothing behind.
+                         forceKillAllBrowsers(`test ${testFile}`);
                          // Force-remove the user-data directory after every
                          // WPT test so the next test starts from a pristine
                          // profile (no cached shaders, no restore tabs, no
@@ -771,6 +803,9 @@ class WptRunner extends WebNNRunner {
                         // processes behind. Sweep any chrome/msedge processes still using our
                         // user-data-dir so we don't accumulate dozens of processes over a run.
                         try { killOwnBrowserProcesses(null); } catch(e) {}
+                        // Blanket force-kill as well, so a retry attempt never
+                        // inherits a browser from the previous attempt.
+                        forceKillAllBrowsers(`retry ${attempt} for ${testFile}`);
                         // Force-remove the user-data directory after every
                         // retry attempt so the next attempt starts from a
                         // pristine profile.
