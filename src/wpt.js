@@ -522,7 +522,7 @@ class WptRunner extends WebNNRunner {
 
     // 4. Retry Logic
     // "all the retries should happen after all the cases run once"
-    const failures = results.filter(r => r.result !== 'PASS');
+    const failures = results.filter(r => r.result !== 'PASS' && r.result !== 'FAIL');
 
     if (failures.length > 0) {
         if (process.env.SKIP_RETRY === 'true') {
