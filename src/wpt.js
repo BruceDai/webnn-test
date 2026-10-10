@@ -11,6 +11,17 @@ const resolveBrowserProcessName = () => {
     return (bPath.includes('msedge') || (process.env.CHROME_CHANNEL || '').includes('edge')) ? 'msedge.exe' : 'chrome.exe';
 };
 
+// wpt.live's own reverse proxy occasionally serves a "504 Gateway Timeout:
+// remote server did not respond to the proxy" page. This is an upstream
+// infra hiccup, not a real test failure, so it's handled separately from
+// normal PASS/FAIL/TIMEOUT classification (see the retry loop in
+// runSingleWptTest).
+function isGatewayTimeoutPage(status, bodyText) {
+    if (status === 504) return true;
+    const text = bodyText || '';
+    return /504\s+Gateway\s+Timeout/i.test(text) || /did not respond to the proxy/i.test(text);
+}
+
 // Blanket force-kill EVERY chrome/msedge process after each WPT iteration
 // (test case and retry attempt). `killOwnBrowserProcesses` only reaps
 // processes whose command line carries our user-data-dir, so it misses
@@ -125,7 +136,12 @@ class WptRunner extends WebNNRunner {
     // the outer chunked-exec timeout is kept comfortably larger than the
     // inner per-case timeout so the inner Promise.race always wins first.
     const caseTimeoutMs = parseInt(process.env.WPT_CASE_TIMEOUT_MS, 10) || 180000; // 3 min per test case (inner)
-    const chunkTimeoutMs = parseInt(process.env.WPT_CHUNK_TIMEOUT_MS, 10) || (caseTimeoutMs + 60000); // outer wrapper
+    // Max time runSingleWptTest will spend retrying a 504 Gateway Timeout
+    // proxy page before giving up (see isGatewayTimeoutPage). Folded into
+    // the outer timeout formulas below so a legitimate 5-minute retry isn't
+    // mistaken for a hang and cut off early.
+    const gatewayTimeoutBudgetMs = parseInt(process.env.WPT_GATEWAY_TIMEOUT_MS, 10) || 300000; // 5 min
+    const chunkTimeoutMs = parseInt(process.env.WPT_CHUNK_TIMEOUT_MS, 10) || (caseTimeoutMs + gatewayTimeoutBudgetMs + 60000); // outer wrapper
     // Hang-kill watchdog: when a test step (including its cleanup) exceeds
     // this budget, force-kill our Chrome processes to unblock any Playwright
     // IPC calls that are stuck at the browser side. This is the last-resort
@@ -1065,8 +1081,32 @@ class WptRunner extends WebNNRunner {
     }
     console.log(`${logPrefix}: ${testName}`);
 
+    // Max time to spend retrying a 504 Gateway Timeout proxy page (wpt.live's
+    // reverse proxy occasionally fails to respond) before giving up and
+    // reporting a TIMEOUT with a specific reason. Polled every
+    // gatewayRetryIntervalMs; if the proxy recovers within the budget, the
+    // test just continues normally.
+    const gatewayTimeoutBudgetMs = parseInt(process.env.WPT_GATEWAY_TIMEOUT_MS, 10) || 300000; // 5 min
+    const gatewayRetryIntervalMs = parseInt(process.env.WPT_GATEWAY_RETRY_INTERVAL_MS, 10) || 15000;
+
     const runTest = async () => {
-        await page.goto(testUrl, { waitUntil: 'networkidle', timeout: navTimeoutMs });
+        const gatewayStart = Date.now();
+        while (true) {
+            const response = await page.goto(testUrl, { waitUntil: 'networkidle', timeout: navTimeoutMs });
+            const status = response ? response.status() : null;
+            const bodyText = await page.evaluate(() => (document.body ? document.body.textContent : '')).catch(() => '');
+
+            if (!isGatewayTimeoutPage(status, bodyText)) break; // normal page, proceed with the test
+
+            const elapsed = Date.now() - gatewayStart;
+            if (elapsed >= gatewayTimeoutBudgetMs) {
+                const err = new Error(`504 Gateway Timeout: WPT proxy did not respond after retrying for ${Math.round(gatewayTimeoutBudgetMs / 1000)}s (${testName})`);
+                err.name = 'GatewayTimeoutError';
+                throw err;
+            }
+            console.log(`[Warning] 504 Gateway Timeout for ${testName} (elapsed ${Math.round(elapsed / 1000)}s/${Math.round(gatewayTimeoutBudgetMs / 1000)}s). Retrying in ${gatewayRetryIntervalMs}ms...`);
+            await page.waitForTimeout(gatewayRetryIntervalMs);
+        }
 
         // check if encounter gpu context error or harness error
         const crashError = await page.evaluate(() => {
@@ -1215,16 +1255,21 @@ class WptRunner extends WebNNRunner {
         // Enforce a global per-case timeout (configurable via WPT_CASE_TIMEOUT_MS,
         // default 180000ms). The error message includes the configured value so
         // the chunkedExec catch (and retry logic) can identify it as a TIMEOUT.
+        // Budget includes gatewayTimeoutBudgetMs so a legitimate 504-retry
+        // loop inside runTest() can run to completion instead of being cut
+        // off early by this generic race (its own dedicated error message
+        // fires first in that case).
         //
         // IMPORTANT: capture the timer id and clear it in .finally() so a fast
         // test doesn't leak a ~180s timer that keeps Node's event loop alive.
         let caseTimeoutId;
+        const overallTimeoutMs = caseTimeoutMs + gatewayTimeoutBudgetMs;
         return await Promise.race([
             runTest(),
             new Promise((_, reject) => {
                 caseTimeoutId = setTimeout(
-                    () => reject(new Error(`Timeout ${caseTimeoutMs}ms exceeded`)),
-                    caseTimeoutMs
+                    () => reject(new Error(`Timeout ${overallTimeoutMs}ms exceeded`)),
+                    overallTimeoutMs
                 );
             })
         ]).finally(() => clearTimeout(caseTimeoutId));
