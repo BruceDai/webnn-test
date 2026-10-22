@@ -182,8 +182,8 @@ class WptRunner extends WebNNRunner {
         throw new Error("WptRunner requires a page in constructor for discovery");
     }
 
-    await this.page.goto(baseWptUrl);
-    await this.page.waitForSelector('.file');
+    await this.page.goto(baseWptUrl, { timeout: 60000 });
+    await this.page.waitForSelector('.file', { timeout: 60000 });
 
     let testFiles = await this.page.$$eval('.file', elements => {
       return elements
