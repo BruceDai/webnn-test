@@ -693,16 +693,29 @@ async function launchBrowser() {
 
    let context, page, browser;
 
+   // Browser launch has historically had no timeout guard anywhere in the
+   // codebase, unlike every other Playwright call (evaluate/close/etc.),
+   // which are all raced against a timeout because the browser-side IPC can
+   // wedge (see the Hang-kill helpers comment above). If the GPU/NPU driver
+   // is left in a bad state by a previous test, launchPersistentContext()
+   // can hang forever with nothing to catch and nothing to log, silently
+   // freezing the whole run. Guard it the same way.
+   const launchTimeoutMs = parseInt(process.env.BROWSER_LAUNCH_TIMEOUT_MS, 10) || 60000;
+
    // Use launchPersistentContext to reuse user data dir
    try {
-       context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+       context = await withHangKill(
+           () => chromium.launchPersistentContext(userDataDir, launchOptions),
+           launchTimeoutMs,
+           'launchPersistentContext'
+       );
        // Always create a new page for the test to avoid interference with restored tabs
-       page = await context.newPage();
+       page = await withHangKill(() => context.newPage(), launchTimeoutMs, 'context.newPage() after launch');
        await page.bringToFront();
    } catch (e) {
        console.error(`[Error] Failed to launch persistent context: ${e.message}`);
        console.log('[Warning]  Falling back to standard launch (fresh profile)...');
-       browser = await chromium.launch(launchOptions);
+       browser = await withHangKill(() => chromium.launch(launchOptions), launchTimeoutMs, 'chromium.launch (fallback)');
        context = await browser.newContext();
        page = await context.newPage();
    }
